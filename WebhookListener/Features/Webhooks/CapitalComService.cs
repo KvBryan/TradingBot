@@ -3,6 +3,7 @@ namespace WebhookListener.Features.Webhooks;
 public class CapitalComService
 {
     private readonly HttpClient _httpClient;
+    private readonly TradingBotDbContext _context;
     private readonly ILogger<CapitalComService> _logger;
     private readonly string _baseUrl;
     private readonly string _apiKey;
@@ -10,10 +11,10 @@ public class CapitalComService
     private readonly string _password;
 
     // --- Variables de Sesión Persistente (Caché en Memoria) ---
-    private string? _cst;
-    private string? _securityToken;
-    private DateTime _tokenExpiration = DateTime.MinValue;
-    private readonly SemaphoreSlim _sessionLock = new(1, 1);
+    private static string? _cst;
+    private static string? _securityToken;
+    private static DateTime _tokenExpiration = DateTime.MinValue;
+    private static readonly SemaphoreSlim _sessionLock = new(1, 1);
 
     // --- Mapeo de Tickers de TradingView a EPICs Oficiales ---
     private static readonly Dictionary<string, string> TickerToEpicMap = new(StringComparer.OrdinalIgnoreCase)
@@ -28,9 +29,11 @@ public class CapitalComService
 
     public CapitalComService(
         HttpClient httpClient,
+        TradingBotDbContext context,
         ILogger<CapitalComService> logger)
     {
         _httpClient = httpClient;
+        _context = context;
         _logger = logger;
 
         // Leer variables de entorno cargadas en la aplicación
@@ -42,7 +45,7 @@ public class CapitalComService
         _password = Environment.GetEnvironmentVariable("CAPITAL_COM_PASSWORD") 
             ?? throw new InvalidOperationException("CAPITAL_COM_PASSWORD environment variable is missing.");
 
-        _baseUrl = environment.ToUpperInvariant() == "LIVE"
+        _baseUrl = environment.Equals("LIVE", StringComparison.OrdinalIgnoreCase)
             ? "https://api-capital.backend-capital.com/api/v1"
             : "https://demo-api-capital.backend-capital.com/api/v1";
 
@@ -52,7 +55,7 @@ public class CapitalComService
     /// <summary>
     /// Resuelve el EPIC correspondiente para un símbolo de TradingView
     /// </summary>
-    public string ResolveEpic(string ticker)
+    private string ResolveEpic(string ticker)
     {
         // Limpiar posibles prefijos (ej: "FX:EURUSD") o guiones
         var cleanTicker = ticker;
@@ -108,20 +111,20 @@ public class CapitalComService
                 throw new Exception($"Failed to authenticate session: {response.StatusCode}. Details: {errContent}");
             }
 
-            if (response.Headers.TryGetValues("CST", out var cstValues) &&
-                response.Headers.TryGetValues("X-SECURITY-TOKEN", out var tokenValues))
+            if (!response.Headers.TryGetValues("CST", out var cstValues) ||
+                !response.Headers.TryGetValues("X-SECURITY-TOKEN", out var tokenValues))
             {
-                _cst = cstValues.FirstOrDefault();
-                _securityToken = tokenValues.FirstOrDefault();
-                
-                // Las sesiones de Capital.com suelen expirar en varias horas, guardamos por 9 minutos
-                _tokenExpiration = DateTime.UtcNow.AddMinutes(9);
-                _logger.LogInformation("Login exitoso en Capital.com. Tokens CST y X-SECURITY-TOKEN almacenados en memoria caché.");
-                
-                return (_cst!, _securityToken!);
+                throw new Exception("La respuesta de autenticación de Capital.com no contenía los encabezados CST o X-SECURITY-TOKEN.");
             }
+
+            _cst = cstValues.FirstOrDefault();
+            _securityToken = tokenValues.FirstOrDefault();
             
-            throw new Exception("La respuesta de autenticación de Capital.com no contenía los encabezados CST o X-SECURITY-TOKEN.");
+            // Las sesiones de Capital.com suelen expirar en varias horas, guardamos por 9 minutos
+            _tokenExpiration = DateTime.UtcNow.AddMinutes(9);
+            _logger.LogInformation("Login exitoso en Capital.com. Tokens CST y X-SECURITY-TOKEN almacenados en memoria caché.");
+            
+            return (_cst!, _securityToken!);
         }
         finally
         {
@@ -132,7 +135,7 @@ public class CapitalComService
     /// <summary>
     /// Consulta el balance líquido de la cuenta
     /// </summary>
-    public async Task<decimal> GetAccountBalanceAsync(string cst, string securityToken)
+    private async Task<decimal> GetAccountBalanceAsync(string cst, string securityToken)
     {
         _logger.LogInformation("Consultando balance de cuentas en Capital.com...");
 
@@ -177,8 +180,8 @@ public class CapitalComService
         var balance = await GetAccountBalanceAsync(cst, securityToken);
 
         // 3. Gestión de Riesgos y Regla del 1%
-        decimal maxRisk = balance * 0.01m; // 1% del saldo líquido
-        decimal slDistance = Math.Abs(alert.EntryPrice - alert.StopLoss);
+        var maxRisk = balance * 0.01m; // 1% del saldo líquido
+        var slDistance = Math.Abs(alert.EntryPrice - alert.StopLoss);
 
         if (slDistance == 0)
         {
@@ -187,8 +190,8 @@ public class CapitalComService
 
         // Definir tamaño de pip según convención Forex (4 decimales para estándar, 2 para JPY)
         var isJpyPair = alert.Symbol.Contains("JPY", StringComparison.OrdinalIgnoreCase);
-        decimal pipSize = isJpyPair ? 0.01m : 0.0001m;
-        decimal slDistanceInPips = slDistance / pipSize;
+        var pipSize = isJpyPair ? 0.01m : 0.0001m;
+        var slDistanceInPips = slDistance / pipSize;
 
         // Tamaño de posición (Size) = Riesgo Máximo / (Distancia SL en Pips * Pip Value por Unidad)
         // Para Forex directo en cuenta USD, el Pip Value por unidad de contrato es el tamaño del Pip (pipSize).
@@ -204,7 +207,7 @@ public class CapitalComService
         }
         else if (alert.Symbol.StartsWith("USD", StringComparison.OrdinalIgnoreCase))
         {
-            calculatedSize = (maxRisk * alert.EntryPrice) / slDistance;
+            calculatedSize = maxRisk * alert.EntryPrice / slDistance;
         }
         else
         {
@@ -227,7 +230,7 @@ public class CapitalComService
         var epic = ResolveEpic(alert.Symbol);
         var positionReq = new PositionRequest(
             Epic: epic,
-            Direction: alert.Action.ToUpperInvariant() == "BUY" ? "BUY" : "SELL",
+            Direction: alert.Action.Equals("BUY", StringComparison.OrdinalIgnoreCase) ? "BUY" : "SELL",
             Size: calculatedSize,
             StopLevel: alert.StopLoss,
             ProfitLevel: alert.TakeProfit
@@ -255,6 +258,27 @@ public class CapitalComService
         var dealRef = posResponse?.DealReference ?? "UnknownReference";
 
         _logger.LogInformation("=== ORDEN EN PILOTO AUTOMÁTICO CONFIRMADA. Ref: {DealRef} ===", dealRef);
+
+        // 5. Guardar el registro en la base de datos PostgreSQL
+        var trade = new Trade
+        {
+            Id = Guid.NewGuid(),
+            Ticker = alert.Symbol,
+            Strategy = alert.Strategy,
+            Direction = alert.Action.Equals("BUY", StringComparison.OrdinalIgnoreCase) ? "BUY" : "SELL",
+            EntryPrice = alert.EntryPrice,
+            StopLoss = alert.StopLoss,
+            TakeProfit = alert.TakeProfit,
+            Size = calculatedSize,
+            Status = "OPEN",
+            ProfitLoss = null,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        await _context.Trades.AddAsync(trade);
+        await _context.SaveChangesAsync();
+
+        _logger.LogInformation("Trade guardado exitosamente en PostgreSQL con ID: {TradeId}", trade.Id);
 
         return new WebhookResponse(
             Success: true,

@@ -38,4 +38,6 @@ public static class ReceiveWebhookEndpoint
     }
 }
 
+// ReSharper disable ClassNeverInstantiated.Global
+// ReSharper disable RedundantTypeDeclarationBody
 internal class ReceiveWebhookEndpointLog { }

@@ -1,3 +1,6 @@
+// ReSharper disable NotAccessedPositionalProperty.Global
+// ReSharper disable ClassNeverInstantiated.Global
+
 using System.Text.Json.Serialization;
 
 namespace WebhookListener.Features.Webhooks;

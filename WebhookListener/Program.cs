@@ -1,3 +1,5 @@
+using Microsoft.EntityFrameworkCore;
+using WebhookListener;
 using WebhookListener.Features.Webhooks;
 using WebhookListener.Middleware;
 
@@ -32,8 +34,13 @@ builder.Services.AddEndpointsApiExplorer();
 // Registrar IHttpClientFactory para gestionar eficientemente conexiones salientes
 builder.Services.AddHttpClient();
 
-// Registrar CapitalComService como Singleton para persistir sesión en memoria caché
-builder.Services.AddSingleton<CapitalComService>();
+// Registrar el DbContext configurado con PostgreSQL
+var connectionString = Environment.GetEnvironmentVariable("CONNECTION_STRING");
+builder.Services.AddDbContext<TradingBotDbContext>(options =>
+    options.UseNpgsql(connectionString));
+
+// Registrar CapitalComService como Scoped
+builder.Services.AddScoped<CapitalComService>();
 
 var app = builder.Build();
 
