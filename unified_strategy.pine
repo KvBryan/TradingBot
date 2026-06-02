@@ -1,0 +1,347 @@
+//@version=5
+strategy("Estrategia Cuantitativa Forex Unificada 2026", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, slippage=1)
+
+// ==========================================
+// 1. PARÁMETROS DE ENTRADA (INPUTS)
+// ==========================================
+
+// --- Módulos Activos ---
+enable_darvas   = input.bool(true, "Habilitar Módulo 1: Darvas Box Break & Retest", group="Configuración de Módulos")
+enable_pullback = input.bool(true, "Habilitar Módulo 2: Trend Pullback", group="Configuración de Módulos")
+enable_sr       = input.bool(true, "Habilitar Módulo 3: S&R Bounce", group="Configuración de Módulos")
+
+// --- Filtros de Control ---
+estimated_spread = input.float(1.5, "Spread Estimado Actual (Pips)", step=0.1, group="Filtros de Control")
+max_spread       = input.float(2.0, "Spread Máximo Permitido (Pips)", step=0.1, group="Filtros de Control")
+
+// --- Módulo 1: Darvas Box & Break-and-Retest ---
+darvas_length          = input.int(10, "Periodo de Caja Darvas (Velas)", minval=5, group="Módulo 1: Darvas Box")
+darvas_max_retest_bars = input.int(30, "Límite de Velas para Retesteo", minval=1, group="Módulo 1: Darvas Box")
+darvas_invalid_mult    = input.float(2.0, "Multiplicador de Invalidez (Alto/Bajo Caja)", step=0.1, group="Módulo 1: Darvas Box")
+
+// --- Módulo 2: Trend Pullback ---
+ema20_len          = input.int(20, "Periodo EMA 20 (Rápida)", minval=5, group="Módulo 2: Trend Pullback")
+ema50_len          = input.int(50, "Periodo EMA 50 (Lenta)", minval=10, group="Módulo 2: Trend Pullback")
+pullback_tolerance = input.float(2.0, "Tolerancia de Pullback (Pips)", step=0.5, group="Módulo 2: Trend Pullback")
+
+// --- Módulo 3: S&R Bounce ---
+low_liq_session = input.session("1200-1600:23456", "Sesión de Operación (Baja Liquidez)", group="Módulo 3: S&R Bounce")
+pivot_len       = input.int(5, "Periodo de Pivotes (Izquierda/Derecha)", minval=2, group="Módulo 3: S&R Bounce")
+
+// --- Gestión de Riesgo ---
+rrr         = input.float(2.0, "Ratio Riesgo / Beneficio (1:X)", minval=1.0, group="Gestión de Riesgo")
+buffer_pips = input.float(2.0, "Buffer del Stop Loss (Pips)", step=0.5, group="Gestión de Riesgo")
+min_sl_pips = input.float(5.0, "Stop Loss Mínimo (Pips)", step=1.0, group="Gestión de Riesgo")
+
+
+// ==========================================
+// 2. FUNCIONES UTILITARIAS Y FORMATO
+// ==========================================
+
+// Determina dinámicamente el tamaño de un Pip (soporta 2, 3, 4 y 5 decimales)
+f_pip_size() =>
+    isFractional = (syminfo.mintick == 0.00001 or syminfo.mintick == 0.001)
+    isFractional ? syminfo.mintick * 10 : syminfo.mintick
+
+// Formatea el precio para evitar problemas de precisión decimal en el string JSON
+f_format_price(val) =>
+    syminfo.mintick == 0.00001 ? str.tostring(val, "#.#####") :
+     syminfo.mintick == 0.0001  ? str.tostring(val, "#.####") :
+     syminfo.mintick == 0.001   ? str.tostring(val, "#.###") :
+     syminfo.mintick == 0.01    ? str.tostring(val, "#.##") :
+     str.tostring(val)
+
+// Construye el JSON estricto sin barras invertidas innecesarias
+f_build_json(action, entry, sl, tp, strategy_name) =>
+    str.format('{{"action": "{0}", "symbol": "{1}", "entry_price": {2}, "stop_loss": {3}, "take_profit": {4}, "strategy": "{5}"}}', 
+               action, syminfo.ticker, f_format_price(entry), f_format_price(sl), f_format_price(tp), strategy_name)
+
+// Calcula los niveles dinámicos de SL y TP aplicando el RRR y el SL mínimo
+f_calc_sl_tp(entry_price, sl_raw, is_long) =>
+    pip_val = f_pip_size()
+    sl_dist = is_long ? entry_price - sl_raw : sl_raw - entry_price
+    sl_dist_pips = sl_dist / pip_val
+    final_sl_dist_pips = math.max(sl_dist_pips, min_sl_pips)
+    
+    final_sl = is_long ? entry_price - final_sl_dist_pips * pip_val : entry_price + final_sl_dist_pips * pip_val
+    final_tp = is_long ? entry_price + final_sl_dist_pips * rrr * pip_val : entry_price - final_sl_dist_pips * rrr * pip_val
+    [final_sl, final_tp]
+
+
+// ==========================================
+// 3. INDICADORES BASE Y CONDICIONES GLOBALES
+// ==========================================
+
+// --- REGLA DE ÁMBITO GLOBAL: CÁLCULOS HISTÓRICOS EN BLOQUE GLOBAL ---
+ema20 = ta.ema(close, ema20_len)
+ema50 = ta.ema(close, ema50_len)
+
+// Máximos y mínimos históricos globales para Darvas y Pullback
+darvas_highest      = ta.highest(high, darvas_length)
+pullback_lowest_5   = ta.lowest(low, 5)
+pullback_highest_5  = ta.highest(high, 5)
+
+// Pivotes históricos globales para S&R Bounce
+ph = ta.pivothigh(high, pivot_len, pivot_len)
+pl = ta.pivotlow(low, pivot_len, pivot_len)
+
+// Condiciones globales no históricas
+pip_size  = f_pip_size()
+spread_ok = estimated_spread <= max_spread
+trend_bullish = ema20 > ema50
+trend_bearish = ema20 < ema50
+in_session = not na(time(timeframe.period, low_liq_session))
+
+
+// ==========================================
+// 4. MÓDULO 1: DARVAS BOX & BREAK-AND-RETEST
+// ==========================================
+
+// Variables persistentes de la Caja de Darvas
+var float box_top          = na
+var float box_bottom       = na
+var bool  waiting_retest   = false
+var int   retest_direction = 0 // 1 = compra (testea techo), -1 = venta (testea suelo)
+var int   break_bar_index  = 0
+
+// Variables para el escáner de rango de consolidación
+var float top_candidate       = na
+var int   top_candidate_age   = 0
+var float bottom_candidate    = na
+var int   bottom_candidate_age = 0
+
+// Escaneo y creación de cajas estáticas (Cumpliendo la Regla de Ámbito Global)
+if enable_darvas and na(box_top)
+    if high == darvas_highest
+        top_candidate        := high
+        top_candidate_age    := 0
+        bottom_candidate     := na
+        bottom_candidate_age := 0
+    else if not na(top_candidate)
+        top_candidate_age := top_candidate_age + 1
+        
+        // Si el precio supera el techo candidato mientras buscamos la caja, invalidamos
+        if high > top_candidate
+            top_candidate        := high
+            top_candidate_age    := 0
+            bottom_candidate     := na
+            bottom_candidate_age := 0
+        else if top_candidate_age >= darvas_length
+            // Buscamos o actualizamos el suelo candidato de forma secuencial sin llamadas históricas condicionales
+            if na(bottom_candidate)
+                bottom_candidate     := low
+                bottom_candidate_age := 0
+            else
+                if low < bottom_candidate
+                    bottom_candidate     := low
+                    bottom_candidate_age := 0
+                else
+                    bottom_candidate_age := bottom_candidate_age + 1
+                    
+                    if bottom_candidate_age >= darvas_length
+                        // Caja confirmada
+                        box_top          := top_candidate
+                        box_bottom       := bottom_candidate
+                        waiting_retest   := false
+                        retest_direction := 0
+
+// Detección de Rompimiento de Caja
+if enable_darvas and not na(box_top) and not na(box_bottom) and not waiting_retest
+    if close > box_top
+        waiting_retest   := true
+        retest_direction := 1
+        break_bar_index  := bar_index
+    else if close < box_bottom
+        waiting_retest   := true
+        retest_direction := -1
+        break_bar_index  := bar_index
+
+// Evaluación de Invalidez de la Caja de Darvas
+box_height = not na(box_top) and not na(box_bottom) ? box_top - box_bottom : 0.0
+is_darvas_invalid = false
+
+if waiting_retest
+    // 1. Límite de tiempo
+    if bar_index - break_bar_index > darvas_max_retest_bars
+        is_darvas_invalid := true
+    // 2. Ruptura del lado contrario de la caja
+    else if retest_direction == 1 and close < box_bottom
+        is_darvas_invalid := true
+    else if retest_direction == -1 and close > box_top
+        is_darvas_invalid := true
+    // 3. Extensión excesiva sin retesteos
+    else if retest_direction == 1 and high > box_top + box_height * darvas_invalid_mult
+        is_darvas_invalid := true
+    else if retest_direction == -1 and low < box_bottom - box_height * darvas_invalid_mult
+        is_darvas_invalid := true
+
+// Función para reiniciar el estado de Darvas
+f_reset_darvas() =>
+    box_top              := na
+    box_bottom           := na
+    waiting_retest       := false
+    retest_direction     := 0
+    top_candidate        := na
+    top_candidate_age    := 0
+    bottom_candidate     := na
+    bottom_candidate_age := 0
+
+if is_darvas_invalid
+    f_reset_darvas()
+
+// Señales y Entradas del Módulo 1 (Retesteo)
+bool darvas_buy_signal  = false
+bool darvas_sell_signal = false
+float darvas_sl         = na
+float darvas_tp         = na
+
+if enable_darvas and waiting_retest and not is_darvas_invalid
+    // Velas de rechazo (Pin Bar / Envolvente)
+    lower_wick = math.min(open, close) - low
+    upper_wick = high - math.max(open, close)
+    body       = math.abs(close - open)
+    
+    is_bullish_pinbar     = (lower_wick >= body * 1.5) and (lower_wick > upper_wick)
+    is_bullish_engulfing  = (close[1] < open[1]) and (close > open) and (close >= open[1]) and (open <= close[1])
+    is_bearish_pinbar     = (upper_wick >= body * 1.5) and (upper_wick > lower_wick)
+    is_bearish_engulfing  = (close[1] > open[1]) and (close < open) and (close <= open[1]) and (open >= close[1])
+
+    if retest_direction == 1 and low <= box_top
+        if (is_bullish_pinbar or is_bullish_engulfing) and barstate.isconfirmed and spread_ok and strategy.position_size == 0
+            raw_sl = box_bottom - buffer_pips * pip_size
+            [sl, tp] = f_calc_sl_tp(close, raw_sl, true)
+            darvas_sl := sl
+            darvas_tp := tp
+            darvas_buy_signal := true
+            
+            alert_msg = f_build_json("buy", close, sl, tp, "Darvas Box Break & Retest")
+            strategy.entry("Darvas_Long", strategy.long, alert_message=alert_msg)
+            strategy.exit("Exit_Darvas_Long", from_entry="Darvas_Long", stop=sl, limit=tp)
+            f_reset_darvas()
+            
+    else if retest_direction == -1 and high >= box_bottom
+        if (is_bearish_pinbar or is_bearish_engulfing) and barstate.isconfirmed and spread_ok and strategy.position_size == 0
+            raw_sl = box_top + buffer_pips * pip_size
+            [sl, tp] = f_calc_sl_tp(close, raw_sl, false)
+            darvas_sl := sl
+            darvas_tp := tp
+            darvas_sell_signal := true
+            
+            alert_msg = f_build_json("sell", close, sl, tp, "Darvas Box Break & Retest")
+            strategy.entry("Darvas_Short", strategy.short, alert_message=alert_msg)
+            strategy.exit("Exit_Darvas_Short", from_entry="Darvas_Short", stop=sl, limit=tp)
+            f_reset_darvas()
+
+
+// ==========================================
+// 5. MÓDULO 2: TREND PULLBACK
+// ==========================================
+
+bool pullback_buy_signal  = false
+bool pullback_sell_signal = false
+
+if enable_pullback and strategy.position_size == 0 and barstate.isconfirmed and spread_ok
+    if trend_bullish
+        // Precio interactúa con la EMA 20 y cierra de forma alcista por encima de ella
+        low_touch = low <= ema20 + pullback_tolerance * pip_size
+        if low_touch and close > ema20 and close > open
+            raw_sl = pullback_lowest_5 - buffer_pips * pip_size
+            [sl, tp] = f_calc_sl_tp(close, raw_sl, true)
+            pullback_buy_signal := true
+            
+            alert_msg = f_build_json("buy", close, sl, tp, "Trend Pullback")
+            strategy.entry("Pullback_Long", strategy.long, alert_message=alert_msg)
+            strategy.exit("Exit_Pullback_Long", from_entry="Pullback_Long", stop=sl, limit=tp)
+            
+    else if trend_bearish
+        // Precio interactúa con la EMA 20 y cierra de forma bajista por debajo de ella
+        high_touch = high >= ema20 - pullback_tolerance * pip_size
+        if high_touch and close < ema20 and close < open
+            raw_sl = pullback_highest_5 + buffer_pips * pip_size
+            [sl, tp] = f_calc_sl_tp(close, raw_sl, false)
+            pullback_sell_signal := true
+            
+            alert_msg = f_build_json("sell", close, sl, tp, "Trend Pullback")
+            strategy.entry("Pullback_Short", strategy.short, alert_message=alert_msg)
+            strategy.exit("Exit_Pullback_Short", from_entry="Pullback_Short", stop=sl, limit=tp)
+
+
+// ==========================================
+// 6. MÓDULO 3: S&R BOUNCE (BAJA LIQUIDEZ)
+// ==========================================
+
+// Variables persistentes para el almacenamiento estático de pivotes confirmados en el pasado
+var float last_pivot_high = na
+var float last_pivot_low  = na
+
+// Se actualizan únicamente cuando se confirma un pivote (evitando look-ahead lag)
+if not na(ph)
+    last_pivot_high := ph
+if not na(pl)
+    last_pivot_low  := pl
+
+bool sr_buy_signal  = false
+bool sr_sell_signal = false
+
+if enable_sr and in_session and strategy.position_size == 0 and barstate.isconfirmed and spread_ok
+    if not na(last_pivot_low) and low <= last_pivot_low and close > last_pivot_low
+        // Validar vela con mecha larga de rechazo (Pin Bar alcista)
+        lower_wick = math.min(open, close) - low
+        upper_wick = high - math.max(open, close)
+        body       = math.abs(close - open)
+        is_bullish_pinbar = (lower_wick >= body * 1.5) and (lower_wick > upper_wick)
+        
+        if is_bullish_pinbar
+            raw_sl = last_pivot_low - buffer_pips * pip_size
+            [sl, tp] = f_calc_sl_tp(close, raw_sl, true)
+            sr_buy_signal := true
+            
+            alert_msg = f_build_json("buy", close, sl, tp, "S&R Bounce")
+            strategy.entry("SR_Long", strategy.long, alert_message=alert_msg)
+            strategy.exit("Exit_SR_Long", from_entry="SR_Long", stop=sl, limit=tp)
+            
+    else if not na(last_pivot_high) and high >= last_pivot_high and close < last_pivot_high
+        // Validar vela con mecha larga de rechazo (Pin Bar bajista)
+        upper_wick = high - math.max(open, close)
+        lower_wick = math.min(open, close) - low
+        body       = math.abs(close - open)
+        is_bearish_pinbar = (upper_wick >= body * 1.5) and (upper_wick > lower_wick)
+        
+        if is_bearish_pinbar
+            raw_sl = last_pivot_high + buffer_pips * pip_size
+            [sl, tp] = f_calc_sl_tp(close, raw_sl, false)
+            sr_sell_signal := true
+            
+            alert_msg = f_build_json("sell", close, sl, tp, "S&R Bounce")
+            strategy.entry("SR_Short", strategy.short, alert_message=alert_msg)
+            strategy.exit("Exit_SR_Short", from_entry="SR_Short", stop=sl, limit=tp)
+
+
+// ==========================================
+// 7. SEÑALES Y GRÁFICOS EN PANTALLA
+// ==========================================
+
+// Dibujo de EMAs
+plot(ema20, color=color.new(color.blue, 10), title="EMA 20 Rápida", linewidth=2)
+plot(ema50, color=color.new(color.orange, 10), title="EMA 50 Lenta", linewidth=2)
+
+// Dibujo de Cajas Darvas (Estáticas)
+plot(box_top, color=not na(box_top) ? color.green : color.new(color.white, 100), style=plot.style_linebr, linewidth=2, title="Darvas Techo")
+plot(box_bottom, color=not na(box_bottom) ? color.red : color.new(color.white, 100), style=plot.style_linebr, linewidth=2, title="Darvas Suelo")
+
+// Dibujo de Niveles de Soportes y Resistencias de Pivotes
+plot(last_pivot_high, color=not na(last_pivot_high) ? color.new(color.red, 40) : color.new(color.white, 100), style=plot.style_linebr, linewidth=1, title="Pivot Resistencia")
+plot(last_pivot_low, color=not na(last_pivot_low) ? color.new(color.green, 40) : color.new(color.white, 100), style=plot.style_linebr, linewidth=1, title="Pivot Soporte")
+
+// Sombreado de la sesión de operación del Módulo 3
+bgcolor(in_session ? color.new(color.yellow, 95) : na, title="Sesión de Operación S&R")
+
+// Señales visuales de compra y venta
+plotshape(darvas_buy_signal, title="Entrada Darvas Compra", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(darvas_sell_signal, title="Entrada Darvas Venta", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+
+plotshape(pullback_buy_signal, title="Entrada Pullback Compra", style=shape.labelup, location=location.belowbar, color=color.blue, text="PB", textcolor=color.white, size=size.small)
+plotshape(pullback_sell_signal, title="Entrada Pullback Venta", style=shape.labeldown, location=location.abovebar, color=color.orange, text="PB", textcolor=color.white, size=size.small)
+
+plotshape(sr_buy_signal, title="Entrada S&R Compra", style=shape.diamond, location=location.belowbar, color=color.purple, size=size.small)
+plotshape(sr_sell_signal, title="Entrada S&R Venta", style=shape.diamond, location=location.abovebar, color=color.purple, size=size.small)

@@ -1,0 +1,129 @@
+================================================================================
+REPORTE DE AUDITORÍA TÉCNICA - ESTRATEGIA FOREX UNIFICADA PINE SCRIPT V5 (2026)
+================================================================================
+
+Este reporte documenta los detalles de arquitectura, lógica, gestión de riesgo y
+configuración de la estrategia cuantitativa unificada desarrollada para Forex.
+
+--------------------------------------------------------------------------------
+1. RESUMEN DEL ARCHIVO DE ESTRATEGIA
+--------------------------------------------------------------------------------
+Ruta: /home/kevin/VSCodeProject /TradingBot/unified_strategy.pine
+Versión de Pine Script: v5 (TradingView)
+Objetivo: Unificar tres patrones de entrada cuantitativos para Forex, aplicando
+gestión de riesgo dinámica y comunicación vía Webhook con JSON estricto libre de
+caracteres de escapado indeseados.
+
+--------------------------------------------------------------------------------
+2. REGLA DE ÁMBITO GLOBAL PARA SERIES HISTÓRICAS (CRÍTICO)
+--------------------------------------------------------------------------------
+Para garantizar un cálculo preciso y evitar errores de compilación en TradingView,
+todas las funciones nativas que dependen de series históricas de datos:
+- ta.ema()
+- ta.highest()
+- ta.lowest()
+- ta.pivothigh()
+- ta.pivotlow()
+
+Han sido declaradas de manera obligatoria en el ámbito GLOBAL (fuera de cualquier
+condicional 'if'). Colocar estas funciones dentro de condicionales (como 
+'if barstate.isconfirmed' o bloques de estado de las cajas) alteraría el historial
+interno de la función en cada barra, provocando fallos en tiempo de ejecución.
+La lógica condicional y la ejecución de órdenes evalúan e interactúan únicamente
+con los valores de retorno de estas variables de cálculo declaradas previamente en
+el bloque global.
+
+--------------------------------------------------------------------------------
+3. ESTRUCTURA Y MÓDULOS DEL SCRIPT
+--------------------------------------------------------------------------------
+
+Módulo de Control y Ejecución:
+- Evita el repintado (repainting) utilizando 'barstate.isconfirmed' en todas
+  las condiciones de evaluación de entrada y alertas. Las señales son estables y
+  solo se gatillan al cerrarse completamente la vela.
+- Filtro de Spread: Permite al usuario configurar el spread actual de su bróker y
+  bloquea las entradas si este es superior al spread máximo permitido.
+
+Módulo 1: Darvas Box & Break-and-Retest (Zonas Estáticas)
+- Identifica zonas de consolidación donde el precio oscila en un rango cerrado de X velas.
+- Congela los límites 'box_top' y 'box_bottom' de forma estática en variables 'var'.
+- Al confirmarse una ruptura (cierre de vela fuera del rango), cambia de estado a
+  'waiting_retest' y guarda la dirección.
+- Gatilla la señal únicamente si el precio regresa a tocar la línea límite (techo
+  roto para compras, suelo roto para ventas) y muestra una confirmación con una
+  vela de rechazo (Pin Bar alcista/bajista o Vela Envolvente) al cierre de la barra.
+- Regla de Reinicio y Reseteo: Limpia todos los niveles y reinicia a 'na' / 'false'
+  bajo las siguientes condiciones:
+  a) Ejecución inmediata del trade en el retest.
+  b) Invalidación: Si transcurren más de X velas desde el rompimiento, si el precio
+     cierra por debajo del extremo opuesto de la caja, o si el precio avanza más
+     de 2.0 veces el alto de la caja sin regresar a retestear (movimiento extendido).
+- Prevención de Look-ahead Lag: La búsqueda secuencial de mínimos y máximos para
+  cajas no resueltas se realiza iterando sobre variables 'var' sin funciones históricas
+  dinámicas internas.
+
+Módulo 2: Trend Pullback (EMAs)
+- Utiliza la relación de EMA 20 y EMA 50 para determinar la dirección tendencial:
+  EMA 20 > EMA 50 (Alcista), EMA 20 < EMA 50 (Bajista).
+- Espera a que el mínimo (en compra) o el máximo (en venta) penetre o se acerque
+  a la EMA 20 a una distancia configurable en pips.
+- Ejecuta al cierre de la primera vela verde (para compras) o vela roja (para ventas)
+  que confirme que la tendencia continúa y el soporte dinámico ha aguantado.
+
+Módulo 3: S&R Bounce (Sesión de Baja Liquidez)
+- Configura una sesión horaria específica (ej. mediodía) en la que la liquidez suele
+  bajar y los rangos tienden a respetarse.
+- Almacena los soportes y resistencias estáticas basados en pivotes históricos
+  confirmados del pasado inmediato ('last_pivot_high' y 'last_pivot_low') utilizando
+  variables estáticas que solo se actualizan cuando ta.pivothigh/low devuelven valores reales.
+- Gatilla una entrada en compra en soporte o venta en resistencia si la vela actual
+  toca el nivel respectivo y cierra con una mecha larga de rechazo (Pin Bar) dentro
+  de la sesión.
+
+--------------------------------------------------------------------------------
+4. DETALLES DE GESTIÓN DE RIESGO
+--------------------------------------------------------------------------------
+- Pip Calculator: Determina el tamaño de 1 Pip multiplicando 'syminfo.mintick * 10'
+  para pares fraccionales (5 decimales o 3 decimales en JPY) y usando 'syminfo.mintick'
+  para los pares de 4 o 2 decimales.
+- Stop Loss Estructural:
+  - Darvas: Debajo del suelo de la caja (compras) o encima del techo (ventas) + buffer.
+  - Pullback: Mínimo/máximo del swing de 5 velas + buffer.
+  - S&R: Debajo de soporte pivote o encima de resistencia pivote + buffer.
+- Filtro de Seguridad de SL Mínimo: Si la distancia al SL calculada es inferior al
+  mínimo configurable en pips (ej. 5 pips), se forza el valor mínimo configurado.
+- Take Profit Rígido: Proyecta la distancia en pips del SL utilizando un ratio RRR
+  configurable de mínimo 1:2.
+- Formateo de Precios: La función interna 'f_format_price(val)' convierte los precios
+  a strings con la precisión exacta del instrumento para evitar errores de parseo
+  en el backend receptor de la alerta.
+
+--------------------------------------------------------------------------------
+5. COMUNICACIÓN MEDIANTE WEBHOOK JSON
+--------------------------------------------------------------------------------
+Para evitar diagonales invertidas redundantes ("\") que causan errores en parsers
+estrictos de C# en servidores en la nube como DigitalOcean, el script define
+comillas simples para delimitar el patrón de formateo de 'str.format()':
+
+Código implementado:
+f_build_json(action, entry, sl, tp, strategy_name) =>
+    str.format('{{"action": "{0}", "symbol": "{1}", "entry_price": {2}, "stop_loss": {3}, "take_profit": {4}, "strategy": "{5}"}}', 
+               action, syminfo.ticker, f_format_price(entry), f_format_price(sl), f_format_price(tp), strategy_name)
+
+Salida de alerta generada (Ejemplo exacto):
+{"action": "buy", "symbol": "EURUSD", "entry_price": 1.12345, "stop_loss": 1.12000, "take_profit": 1.13035, "strategy": "Trend Pullback"}
+
+--------------------------------------------------------------------------------
+6. INSTRUCCIONES DE DESPLIEGUE EN TRADINGVIEW
+--------------------------------------------------------------------------------
+1. Copie el contenido del archivo 'unified_strategy.pine'.
+2. Ingrese a TradingView y abra el editor de código "Pine Editor" en la parte inferior.
+3. Pegue el código en un script nuevo, guarde los cambios y haga clic en "Add to Chart" (Añadir al gráfico).
+4. Para activar las alertas automatizadas por Webhook:
+   - Haga clic en el ícono de "Alertas" (Reloj) en la parte superior derecha de TradingView.
+   - En la sección "Condition" (Condición), elija la estrategia: "Estrategia Cuantitativa Forex Unificada 2026".
+   - En el mensaje de la alerta, pegue el marcador de posición exacto de la estrategia:
+     {{strategy.order.alert_message}}
+   - Marque la casilla de verificación "Webhook URL" e ingrese el URL de su servidor backend.
+   - Guarde la alerta. Cada vez que ocurra una orden confirmada, TradingView enviará el JSON limpio y formateado con los parámetros de riesgo correctos.
+================================================================================
