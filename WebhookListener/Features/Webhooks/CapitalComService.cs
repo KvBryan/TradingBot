@@ -1,7 +1,3 @@
-using System.Collections.Concurrent;
-using System.Net.Http.Json;
-using Microsoft.Extensions.Logging;
-
 namespace WebhookListener.Features.Webhooks;
 
 public class CapitalComService
@@ -40,11 +36,11 @@ public class CapitalComService
         // Leer variables de entorno cargadas en la aplicación
         var environment = Environment.GetEnvironmentVariable("CAPITAL_COM_ENVIRONMENT") ?? "DEMO";
         _apiKey = Environment.GetEnvironmentVariable("CAPITAL_COM_API_KEY") 
-            ?? throw new ArgumentNullException("CAPITAL_COM_API_KEY environment variable is missing.");
+            ?? throw new InvalidOperationException("CAPITAL_COM_API_KEY environment variable is missing.");
         _identifier = Environment.GetEnvironmentVariable("CAPITAL_COM_IDENTIFIER") 
-            ?? throw new ArgumentNullException("CAPITAL_COM_IDENTIFIER environment variable is missing.");
+            ?? throw new InvalidOperationException("CAPITAL_COM_IDENTIFIER environment variable is missing.");
         _password = Environment.GetEnvironmentVariable("CAPITAL_COM_PASSWORD") 
-            ?? throw new ArgumentNullException("CAPITAL_COM_PASSWORD environment variable is missing.");
+            ?? throw new InvalidOperationException("CAPITAL_COM_PASSWORD environment variable is missing.");
 
         _baseUrl = environment.ToUpperInvariant() == "LIVE"
             ? "https://api-capital.backend-capital.com/api/v1"

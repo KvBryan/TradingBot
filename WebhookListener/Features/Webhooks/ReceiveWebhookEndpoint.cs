@@ -1,8 +1,3 @@
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Routing;
-using Microsoft.Extensions.Logging;
-
 namespace WebhookListener.Features.Webhooks;
 
 public static class ReceiveWebhookEndpoint
@@ -10,9 +5,9 @@ public static class ReceiveWebhookEndpoint
     public static void MapWebhookEndpoints(this IEndpointRouteBuilder app)
     {
         app.MapPost("/api/v1/webhook", async (
-            WebhookRequest request,
+            WebhookRequest? request,
             CapitalComService capitalService,
-            ILogger<ReceiveWebhookEndpoint> logger) =>
+            ILogger<ReceiveWebhookEndpointLog> logger) =>
         {
             // 1. Validar que la alerta contenga información
             if (request == null)
@@ -42,4 +37,5 @@ public static class ReceiveWebhookEndpoint
         .WithName("ReceiveTradingViewWebhook");
     }
 }
-internal class ReceiveWebhookEndpoint { } // For dynamic route logging if needed
+
+internal class ReceiveWebhookEndpointLog { }
