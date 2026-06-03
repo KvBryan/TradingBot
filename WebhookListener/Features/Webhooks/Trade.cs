@@ -14,5 +14,5 @@ public class Trade
     public string Status { get; set; } = "OPEN"; // OPEN, WIN, LOSS
     public decimal? ProfitLoss { get; set; }
     public DateTime CreatedAt { get; init; }
-    public bool IsDeleted { get; set; } = false;
+    public bool IsDeleted { get; set; }
 }

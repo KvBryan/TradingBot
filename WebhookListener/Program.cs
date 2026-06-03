@@ -158,7 +158,7 @@ app.UseAuthorization();
 app.MapWebhookEndpoints();
 
 // Mapear Hub de SignalR
-app.MapHub<WebhookListener.Features.Webhooks.TradeHub>("/hubs/trades").RequireAuthorization("DashboardPolicy");
+app.MapHub<TradeHub>("/hubs/trades").RequireAuthorization("DashboardPolicy");
 
 // REST endpoints para el Dashboard
 app.MapGet("/api/v1/trades", async (TradingBotDbContext dbContext) =>
@@ -193,7 +193,7 @@ app.MapGet("/api/v1/balance", async (CapitalComService capitalService) =>
     }
 }).RequireAuthorization("DashboardPolicy");
 
-app.MapDelete("/api/v1/trades/{id:guid}", async (Guid id, TradingBotDbContext dbContext, Microsoft.AspNetCore.SignalR.IHubContext<WebhookListener.Features.Webhooks.TradeHub> hubContext) =>
+app.MapDelete("/api/v1/trades/{id:guid}", async (Guid id, TradingBotDbContext dbContext, IHubContext<TradeHub> hubContext) =>
 {
     var trade = await dbContext.Trades.FindAsync(id);
     if (trade == null) return Results.NotFound();
