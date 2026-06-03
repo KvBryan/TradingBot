@@ -123,10 +123,30 @@ builder.Services.AddAuthorization(options =>
 
 var app = builder.Build();
 
+// --- INICIO: MIGRACIONES AUTOMÁTICAS PARA PRODUCCIÓN ---
+using (var scope = app.Services.CreateScope())
+{
+    var services = scope.ServiceProvider;
+    try
+    {
+        var context = services.GetRequiredService<TradingBotDbContext>();
+        context.Database.Migrate(); // Esto creará las tablas automáticamente en la nube
+    }
+    catch (Exception ex)
+    {
+        var logger = services.GetRequiredService<ILogger<Program>>();
+        logger.LogError(ex, "Error al aplicar las migraciones automáticas.");
+    }
+}
+// --- FIN: MIGRACIONES AUTOMÁTICAS ---
+
 // ==========================================
 // 3. MIDDLEWARE Y ROUTING
 // ==========================================
 app.UseMiddleware<ExceptionHandlingMiddleware>();
+
+app.UseDefaultFiles();
+app.UseStaticFiles();
 
 app.UseCors();
 app.UseCors("CorsDashboard");
@@ -228,6 +248,8 @@ app.MapPost("/api/v1/auth/login", (LoginDto loginDto) =>
 
     return Results.Unauthorized();
 }).AllowAnonymous();
+
+app.MapFallbackToFile("index.html");
 
 app.Run();
 

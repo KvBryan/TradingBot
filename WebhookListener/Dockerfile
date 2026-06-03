@@ -1,28 +1,34 @@
 # ==========================================
-# ETAPA 1: COMPILACIÓN (BUILD)
+# ETAPA 1: COMPILACIÓN DEL FRONTEND (REACT)
 # ==========================================
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
-WORKDIR /src
+FROM node:18-alpine AS frontend-build
+WORKDIR /app
+COPY WebhookListener/dashboard/package*.json ./
+RUN npm install
+COPY WebhookListener/dashboard/ ./
+RUN npm run build
 
-# Copiar archivo de proyecto y restaurar dependencias
+# ==========================================
+# ETAPA 2: COMPILACIÓN DEL BACKEND (.NET 10)
+# ==========================================
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS backend-build
+WORKDIR /src
 COPY ["WebhookListener/WebhookListener.csproj", "WebhookListener/"]
 RUN dotnet restore "WebhookListener/WebhookListener.csproj"
+COPY WebhookListener/ ./WebhookListener/
 
-# Copiar el resto del código y compilar la aplicación
-COPY . .
+# Inyectar los archivos estáticos de React compilados en el wwwroot de .NET
+COPY --from=frontend-build /app/dist ./WebhookListener/wwwroot
+
 WORKDIR "/src/WebhookListener"
 RUN dotnet publish "WebhookListener.csproj" -c Release -o /app/publish /p:UseAppHost=false
 
 # ==========================================
-# ETAPA 2: EJECUCIÓN (RUNTIME)
+# ETAPA 3: EJECUCIÓN (RUNTIME ULTRA-LIVIANO)
 # ==========================================
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 WORKDIR /app
-COPY --from=build /app/publish .
-
-# Exponer el puerto por defecto de ASP.NET Core
+COPY --from=backend-build /app/publish .
 EXPOSE 8080
 ENV ASPNETCORE_URLS=http://+:8080
-
-# Comando de inicio del contenedor
 ENTRYPOINT ["dotnet", "WebhookListener.dll"]

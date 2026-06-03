@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tradingbot-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-TuPasswordSeguro2026}
+      POSTGRES_DB: ${DB_NAME:-tradingbot}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - trading-net
+
+  app:
+    build:
+      context: .
+      dockerfile: WebhookListener/Dockerfile
+    container_name: tradingbot-app
+    restart: always
+    environment:
+      - CONNECTION_STRING=Host=postgres;Port=5432;Database=${DB_NAME:-tradingbot};Username=${DB_USER:-postgres};Password=${DB_PASSWORD:-TuPasswordSeguro2026};Include Error Detail=true
+      - CAPITAL_COM_ENVIRONMENT=${CAPITAL_COM_ENVIRONMENT}
+      - CAPITAL_COM_API_KEY=${CAPITAL_COM_API_KEY}
+      - CAPITAL_COM_IDENTIFIER=${CAPITAL_COM_IDENTIFIER}
+      - CAPITAL_COM_PASSWORD=${CAPITAL_COM_PASSWORD}
+      - DASHBOARD_ADMIN_EMAIL=${DASHBOARD_ADMIN_EMAIL}
+      - DASHBOARD_ADMIN_PASSWORD=${DASHBOARD_ADMIN_PASSWORD}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+    depends_on:
+      - postgres
+    networks:
+      - trading-net
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: tradingbot-caddy
+    restart: always
+    ports:
+      - "80:80"   # HTTP para retos de Let's Encrypt
+      - "443:443" # HTTPS encriptado para TradingView y tu Dashboard
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+    networks:
+      - trading-net
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
+
+networks:
+  trading-net:
+    driver: bridge

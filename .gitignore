@@ -1,0 +1,28 @@
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Environment files (CRITICAL: NEVER commit secrets!)
+.env
+.env.*
+!.env.example
+
+# C# build outputs
+**/bin/
+**/obj/
+*.user
+*.suo
+
+# Node/Frontend outputs
+**/node_modules/
+**/dist/
+.npm/
+
+# Static Analysis / Qodana
+qodana.sarif.json
+
+# Agents
+.agents/
+**/.agents/
