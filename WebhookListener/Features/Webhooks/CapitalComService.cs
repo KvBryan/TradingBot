@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.SignalR;
+
 namespace WebhookListener.Features.Webhooks;
 
 public class CapitalComService
@@ -5,6 +7,7 @@ public class CapitalComService
     private readonly HttpClient _httpClient;
     private readonly TradingBotDbContext _context;
     private readonly ILogger<CapitalComService> _logger;
+    private readonly IHubContext<TradeHub> _hubContext;
     private readonly string _baseUrl;
     private readonly string _apiKey;
     private readonly string _identifier;
@@ -30,11 +33,13 @@ public class CapitalComService
     public CapitalComService(
         HttpClient httpClient,
         TradingBotDbContext context,
-        ILogger<CapitalComService> logger)
+        ILogger<CapitalComService> logger,
+        IHubContext<TradeHub> hubContext)
     {
         _httpClient = httpClient;
         _context = context;
         _logger = logger;
+        _hubContext = hubContext;
 
         // Leer variables de entorno cargadas en la aplicación
         var environment = Environment.GetEnvironmentVariable("CAPITAL_COM_ENVIRONMENT") ?? "DEMO";
@@ -280,11 +285,31 @@ public class CapitalComService
 
         _logger.LogInformation("Trade guardado exitosamente en PostgreSQL con ID: {TradeId}", trade.Id);
 
+        // Notificar en tiempo real vía SignalR
+        try
+        {
+            await _hubContext.Clients.All.SendAsync("TradeUpdated", trade);
+            _logger.LogInformation("Trade broadcasted via SignalR to all clients.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error al transmitir actualización de trade a través de SignalR Hub.");
+        }
+
         return new WebhookResponse(
             Success: true,
             Message: $"Posición Bracket abierta exitosamente en Capital.com para {epic}.",
             DealReference: dealRef,
             CalculatedSize: calculatedSize
         );
+    }
+
+    /// <summary>
+    /// Método público para obtener el balance actual de la cuenta conectada.
+    /// </summary>
+    public async Task<decimal> GetCurrentBalanceAsync()
+    {
+        var (cst, securityToken) = await GetSessionTokensAsync();
+        return await GetAccountBalanceAsync(cst, securityToken);
     }
 }

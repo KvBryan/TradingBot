@@ -1,4 +1,4 @@
-//@version=5
+//@version=6
 strategy("Estrategia Cuantitativa Forex Unificada 2026", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, slippage=1)
 
 // ==========================================
@@ -13,6 +13,7 @@ enable_sr       = input.bool(true, "Habilitar Módulo 3: S&R Bounce", group="Con
 // --- Filtros de Control ---
 estimated_spread = input.float(1.5, "Spread Estimado Actual (Pips)", step=0.1, group="Filtros de Control")
 max_spread       = input.float(2.0, "Spread Máximo Permitido (Pips)", step=0.1, group="Filtros de Control")
+ny_session       = input.session("0600-1200:23456", "Sesión de Alta Liquidez (Nueva York)", group="Filtros de Control")
 
 // --- Módulo 1: Darvas Box & Break-and-Retest ---
 darvas_length          = input.int(10, "Periodo de Caja Darvas (Velas)", minval=5, group="Módulo 1: Darvas Box")
@@ -91,6 +92,7 @@ spread_ok = estimated_spread <= max_spread
 trend_bullish = ema20 > ema50
 trend_bearish = ema20 < ema50
 in_session = not na(time(timeframe.period, low_liq_session))
+is_ny_session = not na(time(timeframe.period, ny_session))
 
 
 // ==========================================
@@ -107,7 +109,7 @@ var int   break_bar_index  = 0
 // Variables para el escáner de rango de consolidación
 var float top_candidate       = na
 var int   top_candidate_age   = 0
-var float bottom_candidate    = na
+var float bottom_candidate     = na
 var int   bottom_candidate_age = 0
 
 // Escaneo y creación de cajas estáticas (Cumpliendo la Regla de Ámbito Global)
@@ -146,7 +148,7 @@ if enable_darvas and na(box_top)
                         retest_direction := 0
 
 // Detección de Rompimiento de Caja
-if enable_darvas and not na(box_top) and not na(box_bottom) and not waiting_retest
+if enable_darvas and is_ny_session and not na(box_top) and not na(box_bottom) and not waiting_retest
     if close > box_top
         waiting_retest   := true
         retest_direction := 1
@@ -175,8 +177,8 @@ if waiting_retest
     else if retest_direction == -1 and low < box_bottom - box_height * darvas_invalid_mult
         is_darvas_invalid := true
 
-// Función para reiniciar el estado de Darvas
-f_reset_darvas() =>
+// REINICIO DIRECTO INLINE (Solución al error CE10088)
+if is_darvas_invalid
     box_top              := na
     box_bottom           := na
     waiting_retest       := false
@@ -186,16 +188,13 @@ f_reset_darvas() =>
     bottom_candidate     := na
     bottom_candidate_age := 0
 
-if is_darvas_invalid
-    f_reset_darvas()
-
 // Señales y Entradas del Módulo 1 (Retesteo)
 bool darvas_buy_signal  = false
 bool darvas_sell_signal = false
 float darvas_sl         = na
 float darvas_tp         = na
 
-if enable_darvas and waiting_retest and not is_darvas_invalid
+if enable_darvas and is_ny_session and waiting_retest and not is_darvas_invalid
     // Velas de rechazo (Pin Bar / Envolvente)
     lower_wick = math.min(open, close) - low
     upper_wick = high - math.max(open, close)
@@ -217,7 +216,16 @@ if enable_darvas and waiting_retest and not is_darvas_invalid
             alert_msg = f_build_json("buy", close, sl, tp, "Darvas Box Break & Retest")
             strategy.entry("Darvas_Long", strategy.long, alert_message=alert_msg)
             strategy.exit("Exit_Darvas_Long", from_entry="Darvas_Long", stop=sl, limit=tp)
-            f_reset_darvas()
+            
+            // Reinicio inline post-operación larga
+            box_top              := na
+            box_bottom           := na
+            waiting_retest       := false
+            retest_direction     := 0
+            top_candidate        := na
+            top_candidate_age    := 0
+            bottom_candidate     := na
+            bottom_candidate_age := 0
             
     else if retest_direction == -1 and high >= box_bottom
         if (is_bearish_pinbar or is_bearish_engulfing) and barstate.isconfirmed and spread_ok and strategy.position_size == 0
@@ -230,8 +238,16 @@ if enable_darvas and waiting_retest and not is_darvas_invalid
             alert_msg = f_build_json("sell", close, sl, tp, "Darvas Box Break & Retest")
             strategy.entry("Darvas_Short", strategy.short, alert_message=alert_msg)
             strategy.exit("Exit_Darvas_Short", from_entry="Darvas_Short", stop=sl, limit=tp)
-            f_reset_darvas()
-
+            
+            // Reinicio inline post-operación corta
+            box_top              := na
+            box_bottom           := na
+            waiting_retest       := false
+            retest_direction     := 0
+            top_candidate        := na
+            top_candidate_age    := 0
+            bottom_candidate     := na
+            bottom_candidate_age := 0
 
 // ==========================================
 // 5. MÓDULO 2: TREND PULLBACK
@@ -240,7 +256,7 @@ if enable_darvas and waiting_retest and not is_darvas_invalid
 bool pullback_buy_signal  = false
 bool pullback_sell_signal = false
 
-if enable_pullback and strategy.position_size == 0 and barstate.isconfirmed and spread_ok
+if enable_pullback and is_ny_session and strategy.position_size == 0 and barstate.isconfirmed and spread_ok
     if trend_bullish
         // Precio interactúa con la EMA 20 y cierra de forma alcista por encima de ella
         low_touch = low <= ema20 + pullback_tolerance * pip_size
@@ -333,8 +349,9 @@ plot(box_bottom, color=not na(box_bottom) ? color.red : color.new(color.white, 1
 plot(last_pivot_high, color=not na(last_pivot_high) ? color.new(color.red, 40) : color.new(color.white, 100), style=plot.style_linebr, linewidth=1, title="Pivot Resistencia")
 plot(last_pivot_low, color=not na(last_pivot_low) ? color.new(color.green, 40) : color.new(color.white, 100), style=plot.style_linebr, linewidth=1, title="Pivot Soporte")
 
-// Sombreado de la sesión de operación del Módulo 3
+// Sombreado de las sesiones de operación
 bgcolor(in_session ? color.new(color.yellow, 95) : na, title="Sesión de Operación S&R")
+bgcolor(is_ny_session ? color.new(color.blue, 96) : na, title="Sesión de Operación NY")
 
 // Señales visuales de compra y venta
 plotshape(darvas_buy_signal, title="Entrada Darvas Compra", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)

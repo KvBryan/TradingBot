@@ -5,11 +5,12 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
 # Copiar archivo de proyecto y restaurar dependencias
-COPY ["WebhookListener.csproj", "./"]
-RUN dotnet restore "WebhookListener.csproj"
+COPY ["WebhookListener/WebhookListener.csproj", "WebhookListener/"]
+RUN dotnet restore "WebhookListener/WebhookListener.csproj"
 
 # Copiar el resto del código y compilar la aplicación
 COPY . .
+WORKDIR "/src/WebhookListener"
 RUN dotnet publish "WebhookListener.csproj" -c Release -o /app/publish /p:UseAppHost=false
 
 # ==========================================
