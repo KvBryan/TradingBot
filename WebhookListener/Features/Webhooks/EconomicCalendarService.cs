@@ -8,7 +8,6 @@ public class EconomicCalendarService
     private readonly HttpClient _httpClient;
     private readonly ILogger<EconomicCalendarService> _logger;
     private List<EconomicEvent> _events = new();
-    private DateTime _lastFetchTime = DateTime.MinValue;
     private readonly string _cacheFilePath = "news_calendar.json";
 
     public EconomicCalendarService(HttpClient httpClient, ILogger<EconomicCalendarService> logger)
@@ -105,7 +104,6 @@ public class EconomicCalendarService
                         Event = e.Event ?? "Unknown Macro Event"
                     }).ToList();
 
-                _lastFetchTime = DateTime.UtcNow;
                 await SaveCachedEventsAsync();
             }
             else
