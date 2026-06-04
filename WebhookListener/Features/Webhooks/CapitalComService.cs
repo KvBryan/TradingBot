@@ -10,6 +10,7 @@ public class CapitalComService
     private readonly ILogger<CapitalComService> _logger;
     private readonly IHubContext<TradeHub> _hubContext;
     private readonly EconomicCalendarService _calendarService;
+    private readonly TelegramNotificationService _telegramService;
     private readonly string _baseUrl;
     private readonly string _apiKey;
     private readonly string _identifier;
@@ -37,13 +38,15 @@ public class CapitalComService
         TradingBotDbContext context,
         ILogger<CapitalComService> logger,
         IHubContext<TradeHub> hubContext,
-        EconomicCalendarService calendarService)
+        EconomicCalendarService calendarService,
+        TelegramNotificationService telegramService)
     {
         _httpClient = httpClient;
         _context = context;
         _logger = logger;
         _hubContext = hubContext;
         _calendarService = calendarService;
+        _telegramService = telegramService;
 
         // Leer variables de entorno cargadas en la aplicación
         var environment = Environment.GetEnvironmentVariable("CAPITAL_COM_ENVIRONMENT") ?? "DEMO";
@@ -232,6 +235,13 @@ public class CapitalComService
                 _logger.LogError(ex, "Error al transmitir actualización de cierre por SignalR.");
             }
 
+            // Notificación a Telegram
+            var closeMsg = $"🔴 <b>ORDEN CERRADA</b>\n" +
+                           $"<b>Par:</b> {symbol}\n" +
+                           $"<b>Estrategia:</b> {strategy}\n" +
+                           $"<b>Resultado:</b> {(capitalClosed ? "Cerrada en Broker y DB" : "Cerrada solo en DB (sin DealReference)")}";
+            await _telegramService.SendNotificationAsync(closeMsg);
+
             return new WebhookResponse(
                 Success: true,
                 Message: capitalClosed 
@@ -249,6 +259,13 @@ public class CapitalComService
         if (activeTrade != null)
         {
             _logger.LogWarning("Se recibió una señal de APERTURA para {Symbol} con estrategia {Strategy}, pero ya existe una posición activa abierta en PostgreSQL.", symbol, strategy);
+            
+            var rejectMsg = $"⚠️ <b>ALERTA RECHAZADA (Doble Posición DB)</b>\n" +
+                            $"<b>Par:</b> {symbol}\n" +
+                            $"<b>Estrategia:</b> {strategy}\n" +
+                            $"<b>Detalle:</b> Ya existe una posición abierta para este par en PostgreSQL.";
+            await _telegramService.SendNotificationAsync(rejectMsg);
+
             return new WebhookResponse(false, $"Ya existe una posición abierta para {symbol} con esta estrategia. Orden ignorada para evitar sobreexposición.");
         }
         
@@ -260,6 +277,13 @@ public class CapitalComService
         if (isNearNews)
         {
             _logger.LogWarning("Orden de APERTURA para {Symbol} rechazada en C# debido a proximidad con noticia macro de alto impacto (+/- 15 minutos).", symbol);
+            
+            var newsRejectMsg = $"⚠️ <b>ALERTA RECHAZADA (Filtro de Noticias)</b>\n" +
+                                $"<b>Par:</b> {symbol}\n" +
+                                $"<b>Estrategia:</b> {strategy}\n" +
+                                $"<b>Detalle:</b> Proximidad con noticia macro de alto impacto (+/- 15 min).";
+            await _telegramService.SendNotificationAsync(newsRejectMsg);
+
             return new WebhookResponse(false, "Orden rechazada por proximidad a noticia macro de alto impacto.");
         }
 
@@ -288,6 +312,13 @@ public class CapitalComService
         if (hasRealActivePosition)
         {
             _logger.LogWarning("Se recibió señal de APERTURA para {Symbol}, pero Capital.com ya tiene una posición abierta real en el broker.", symbol);
+            
+            var brokerRejectMsg = $"⚠️ <b>ALERTA RECHAZADA (Doble Posición Broker)</b>\n" +
+                                  $"<b>Par:</b> {symbol}\n" +
+                                  $"<b>Estrategia:</b> {strategy}\n" +
+                                  $"<b>Detalle:</b> El broker Capital.com ya tiene una posición activa para este par.";
+            await _telegramService.SendNotificationAsync(brokerRejectMsg);
+
             return new WebhookResponse(false, $"Orden ignorada. Ya existe una posición abierta en el broker real para {symbol}.");
         }
 
@@ -298,6 +329,13 @@ public class CapitalComService
         if (!marketStatus.Equals("TRADEABLE", StringComparison.OrdinalIgnoreCase))
         {
             _logger.LogWarning("El mercado para {Symbol} no está operable en este momento: {Status}", symbol, marketStatus);
+            
+            var mktRejectMsg = $"⚠️ <b>ALERTA RECHAZADA (Mercado no Operable)</b>\n" +
+                               $"<b>Par:</b> {symbol}\n" +
+                               $"<b>Estrategia:</b> {strategy}\n" +
+                               $"<b>Detalle:</b> El mercado se encuentra en estado: {marketStatus}";
+            await _telegramService.SendNotificationAsync(mktRejectMsg);
+
             return new WebhookResponse(false, $"Mercado no operable ({marketStatus}).");
         }
 
@@ -313,6 +351,13 @@ public class CapitalComService
         {
             _logger.LogWarning("Orden de APERTURA para {Symbol} rechazada debido a spread real ensanchado: {RealSpread} pips (Máximo permitido: {MaxSpread} pips)", 
                 symbol, realSpreadInPips.ToString("F2"), maxAllowedSpread);
+            
+            var spreadRejectMsg = $"⚠️ <b>ALERTA RECHAZADA (Spread Alto)</b>\n" +
+                                  $"<b>Par:</b> {symbol}\n" +
+                                  $"<b>Estrategia:</b> {strategy}\n" +
+                                  $"<b>Detalle:</b> El spread real ({realSpreadInPips:F1} pips) supera el límite máximo permitido ({maxAllowedSpread} pips).";
+            await _telegramService.SendNotificationAsync(spreadRejectMsg);
+
             return new WebhookResponse(false, $"Orden rechazada por spread real ensanchado ({realSpreadInPips:F1} pips).");
         }
 
@@ -435,6 +480,17 @@ public class CapitalComService
         {
             _logger.LogError(ex, "Error al transmitir actualización de trade a través de SignalR Hub.");
         }
+
+        // Notificar a Telegram de la nueva orden ejecutada
+        var successMsg = $"🟢 <b>NUEVA ORDEN EJECUTADA</b>\n" +
+                         $"<b>Par:</b> {symbol}\n" +
+                         $"<b>Dirección:</b> {trade.Direction}\n" +
+                         $"<b>Lotes:</b> {calculatedSize}\n" +
+                         $"<b>Entrada:</b> {trade.EntryPrice}\n" +
+                         $"<b>SL:</b> {trade.StopLoss} | <b>TP:</b> {trade.TakeProfit}\n" +
+                         $"<b>Estrategia:</b> {strategy}\n" +
+                         $"<b>Referencia:</b> <code>{dealIdOrRef}</code>";
+        await _telegramService.SendNotificationAsync(successMsg);
 
         return new WebhookResponse(
             Success: true,
@@ -666,6 +722,12 @@ public class CapitalComService
                     
                     // Notificar vía SignalR del cambio de estado
                     await _hubContext.Clients.All.SendAsync("TradeUpdated", trade);
+
+                    // Notificar a Telegram del cierre
+                    var closeMsg = $"⚠️ <b>CONCILIACIÓN: Posición Cerrada</b>\n" +
+                                   $"La posición de <b>{trade.Ticker}</b> ({trade.Direction}) con referencia <code>{trade.DealReference}</code> ya no está activa en Capital.com.\n" +
+                                   $"Se ha marcado localmente como <code>CLOSED</code>.";
+                    await _telegramService.SendNotificationAsync(closeMsg);
                 }
                 else
                 {
@@ -777,6 +839,14 @@ public class CapitalComService
 
                     // Emitir en tiempo real vía SignalR
                     await _hubContext.Clients.All.SendAsync("TradeUpdated", newTrade);
+
+                    // Notificar a Telegram de la importación externa
+                    var importMsg = $"ℹ️ <b>CONCILIACIÓN: Posición Externa Detectada</b>\n" +
+                                    $"Se detectó e importó una posición externa/manual activa en Capital.com:\n" +
+                                    $"<b>Par:</b> {newTrade.Ticker} | <b>Dirección:</b> {newTrade.Direction}\n" +
+                                    $"<b>Lotes:</b> {newTrade.Size} | <b>Entrada:</b> {newTrade.EntryPrice}\n" +
+                                    $"<b>Referencia:</b> <code>{newTrade.DealReference}</code>";
+                    await _telegramService.SendNotificationAsync(importMsg);
                 }
             }
 

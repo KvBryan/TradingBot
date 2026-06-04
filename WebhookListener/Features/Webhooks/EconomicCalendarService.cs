@@ -19,23 +19,31 @@ public class EconomicCalendarService
 
     public async Task InitializeAsync()
     {
-        await LoadCachedEventsAsync();
+        // 1. Cargar caché de disco a memoria RAM solo si la lista interna está vacía (por ejemplo, al iniciar)
+        if (_events.Count == 0)
+        {
+            await LoadCachedEventsAsync();
+        }
         
         var provider = Environment.GetEnvironmentVariable("ECONOMIC_CALENDAR_PROVIDER");
         var apiKey = Environment.GetEnvironmentVariable("ECONOMIC_CALENDAR_API_KEY");
 
         if (!string.IsNullOrEmpty(provider) && !string.IsNullOrEmpty(apiKey))
         {
-            try
+            // 2. Comprobar si el archivo local no existe o fue modificado hace más de 24 horas
+            bool fileExists = File.Exists(_cacheFilePath);
+            bool isOld = !fileExists || (DateTime.UtcNow - File.GetLastWriteTimeUtc(_cacheFilePath) > TimeSpan.FromDays(1));
+
+            if (isOld)
             {
-                if (DateTime.UtcNow - _lastFetchTime > TimeSpan.FromDays(1))
+                try
                 {
                     await FetchFromProviderAsync(provider, apiKey);
                 }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error al sincronizar el calendario económico externo. Usando base de datos caché local.");
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error al sincronizar el calendario económico externo. Usando base de datos caché local.");
+                }
             }
         }
     }

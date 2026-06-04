@@ -66,6 +66,7 @@ builder.Services.AddDbContext<TradingBotDbContext>(options =>
 
 // Registrar CapitalComService como Scoped
 builder.Services.AddSingleton<EconomicCalendarService>();
+builder.Services.AddSingleton<TelegramNotificationService>();
 builder.Services.AddScoped<CapitalComService>();
 builder.Services.AddHostedService<CapitalComSyncWorker>();
 
