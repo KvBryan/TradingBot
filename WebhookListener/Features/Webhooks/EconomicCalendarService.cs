@@ -140,7 +140,7 @@ public class EconomicCalendarService
     {
         await InitializeAsync();
 
-        if (_events == null || _events.Count == 0)
+        if (_events.Count == 0)
         {
             return false;
         }
@@ -186,10 +186,9 @@ public class EconomicEvent
     public string Event { get; set; } = string.Empty;
 }
 
-public class FmpEconomicEvent
-{
-    [JsonPropertyName("date")] public string? Date { get; set; }
-    [JsonPropertyName("country")] public string? Country { get; set; }
-    [JsonPropertyName("event")] public string? Event { get; set; }
-    [JsonPropertyName("impact")] public string? Impact { get; set; }
-}
+public record FmpEconomicEvent(
+    [property: JsonPropertyName("date")] string? Date = null,
+    [property: JsonPropertyName("country")] string? Country = null,
+    [property: JsonPropertyName("event")] string? Event = null,
+    [property: JsonPropertyName("impact")] string? Impact = null
+);
