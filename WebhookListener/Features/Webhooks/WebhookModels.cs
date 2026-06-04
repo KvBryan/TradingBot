@@ -9,10 +9,13 @@ namespace WebhookListener.Features.Webhooks;
 public record WebhookRequest(
     [property: JsonPropertyName("action")] string Action,
     [property: JsonPropertyName("symbol")] string Symbol,
-    [property: JsonPropertyName("entry_price")] decimal EntryPrice,
-    [property: JsonPropertyName("stop_loss")] decimal StopLoss,
-    [property: JsonPropertyName("take_profit")] decimal TakeProfit,
-    [property: JsonPropertyName("strategy")] string Strategy
+    [property: JsonPropertyName("entry_price")] decimal? EntryPrice = null,
+    [property: JsonPropertyName("stop_loss")] decimal? StopLoss = null,
+    [property: JsonPropertyName("take_profit")] decimal? TakeProfit = null,
+    [property: JsonPropertyName("strategy")] string Strategy,
+    [property: JsonPropertyName("lot_size")] decimal? LotSize = null,
+    [property: JsonPropertyName("magic_number")] int? MagicNumber = null,
+    [property: JsonPropertyName("trade_id")] string? TradeId = null
 );
 
 // --- DTO de Respuesta de la API Webhook ---
@@ -58,4 +61,43 @@ public record PositionRequest(
 
 public record PositionResponse(
     [property: JsonPropertyName("dealReference")] string DealReference
+);
+
+// --- DTOs para Obtener Posiciones Abiertas de Capital.com ---
+public record CapitalPositionsResponse(
+    [property: JsonPropertyName("positions")] List<CapitalPositionItem>? Positions
+);
+
+public record CapitalPositionItem(
+    [property: JsonPropertyName("position")] CapitalPositionDetails? Position,
+    [property: JsonPropertyName("market")] CapitalMarketDetails? Market
+);
+
+public record CapitalPositionDetails(
+    [property: JsonPropertyName("dealId")] string? DealId,
+    [property: JsonPropertyName("dealReference")] string? DealReference,
+    [property: JsonPropertyName("direction")] string? Direction,
+    [property: JsonPropertyName("size")] decimal? Size,
+    [property: JsonPropertyName("level")] decimal? Level,
+    [property: JsonPropertyName("createdDate")] string? CreatedDate,
+    [property: JsonPropertyName("stopLevel")] decimal? StopLevel,
+    [property: JsonPropertyName("profitLevel")] decimal? ProfitLevel,
+    [property: JsonPropertyName("upl")] decimal? Upl
+);
+
+public record CapitalMarketDetails(
+    [property: JsonPropertyName("epic")] string? Epic,
+    [property: JsonPropertyName("symbol")] string? Symbol,
+    [property: JsonPropertyName("instrumentName")] string? InstrumentName
+);
+
+// --- DTOs para Confirmación de Órdenes de Capital.com ---
+public record CapitalConfirmResponse(
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("affectedDeals")] List<CapitalAffectedDeal> AffectedDeals
+);
+
+public record CapitalAffectedDeal(
+    [property: JsonPropertyName("dealId")] string DealId,
+    [property: JsonPropertyName("status")] string Status
 );

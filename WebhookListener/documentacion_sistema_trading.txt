@@ -1,0 +1,242 @@
+================================================================================
+DOCUMENTACIÓN GENERAL DEL PROYECTO: SISTEMA DE ALGO-TRADING HMM V6
+================================================================================
+
+Este documento detalla exhaustivamente la arquitectura, el diseño matemático, el stack tecnológico, la estructura y el flujo de despliegue del sistema cuantitativo automatizado de trading. Está estructurado de forma técnica para facilitar el análisis por modelos de Inteligencia Artificial u otros motores de desarrollo.
+
+--------------------------------------------------------------------------------
+1. OBJETIVO DEL SISTEMA
+--------------------------------------------------------------------------------
+El sistema está diseñado para la operación automatizada en el mercado Forex y commodities 24/7. Su propósito es capturar movimientos expansivos de tendencia y filtrar por completo los periodos de consolidación lateral ("chop" o rango plano) que causan la mayoría de pérdidas en estrategias tendenciales. 
+
+La ejecución se realiza conectando las señales algorítmicas de TradingView en tiempo real con la API del broker Capital.com a través de un backend intermedio que valida la gestión de riesgos, almacena el historial en base de datos y provee visualización a través de un panel de control en tiempo real.
+
+--------------------------------------------------------------------------------
+2. ARQUITECTURA GLOBAL DEL SISTEMA (FLUJO DE DATOS)
+--------------------------------------------------------------------------------
+El sistema opera bajo un flujo lineal cerrado con retroalimentación:
+
+[ TradingView (Pine Script v6) ]
+               │
+               ▼ (Alerta Webhook POST JSON con trade_id único)
+[ Caddy Proxy Inverso (HTTPS / SSL) ]
+               │
+               ▼
+[ Webhook Listener (ASP.NET Core Web API) ] <───> [ PostgreSQL Db ]
+               │                                      │
+               ├──────────────────────────────────────┤
+               ▼ (REST API Orders)                    ▼ (SignalR WebSockets)
+[ Capital.com Broker API ]               [ React Dashboard (Vite) ]
+               │
+               ▼ (Ejecución real)
+        [ Mercado Forex ]
+
+--------------------------------------------------------------------------------
+3. DETALLE DEL STACK TECNOLÓGICO
+--------------------------------------------------------------------------------
+
+A. ESTRATEGIA Y GENERACIÓN DE SEÑALES (FRONT-END TRADINGVIEW)
+   - Compilador: Pine Script v6.
+   - Parámetro de Regla de Cierre: `close_entries_rule = "ANY"` inyectado para asegurar la compatibilidad con el motor v6 y evitar la desincronización FIFO de posiciones acumuladas.
+   - Motor Matemático: Hidden Markov Model (HMM) autocalibrable de 2 estados.
+   - Lógica de Entrada: Canal Darvas Box adaptado sin retraso de pivote y ejecución por **Órdenes Límite** (Buy Limit / Sell Limit).
+   - Lógica de Riesgo: Lotaje dinámico por volatilidad ATR y especificaciones del contrato (`syminfo.contractsize`, `syminfo.pipvalue`).
+
+B. PROCESAMIENTO Y EJECUCIÓN (BACKEND - MICROSERVICIO C#)
+   - Framework: .NET 8/9 (ASP.NET Core Minimal APIs).
+   - Base de Datos: PostgreSQL.
+   - ORM: Entity Framework Core (EF Core) con soporte para migraciones.
+   - Broker API Client: HttpClient seguro que implementa cifrado y autenticación por API Keys de Capital.com (Demo/Live).
+   - Hilos en Segundo Plano: HostedService (`CapitalComSyncWorker`) para sincronizar cuentas y posiciones activas del broker cada N segundos.
+   - Comunicación en tiempo real: SignalR Hub (`TradeHub`) para notificar ejecuciones y telemetría al frontend.
+   - Seguridad: JWT Bearer tokens para proteger los endpoints y las conexiones WebSocket del dashboard.
+
+C. INTERFAZ GRÁFICA (FRONTEND - PANEL DE CONTROL)
+   - Framework: React (Vite) + TypeScript + Tailwind CSS.
+   - Conectividad: Cliente SignalR para suscripción a WebSockets y Axios para peticiones REST al Backend.
+   - Funcionalidades: Telemetría de cuenta (Margen, Equidad, Balance), listado de posiciones activas, registro de logs de auditoría en vivo y estado diario del drawdown.
+
+D. DESPLIEGUE E INFRAESTRUCTURA
+   - Servidor: VPS Linux (Ubuntu).
+   - Contenedores: Docker & Docker Compose para empaquetar el microservicio C# y la base de datos PostgreSQL.
+   - Servidor Web & SSL: Caddy Server (configurado como proxy inverso y gestor automático de certificados Let's Encrypt).
+
+--------------------------------------------------------------------------------
+4. ESTRUCTURA DE ARCHIVOS Y CARPETAS
+--------------------------------------------------------------------------------
+La estructura de carpetas en el repositorio es la siguiente:
+
+/
+├── codigo_pine_hmm_v6.txt      <-- Código Pine Script v6 optimizado
+├── codigo_respaldo_pine.txt    <-- Copia de seguridad del script anterior
+├── documentacion_sistema_trading.txt <-- Este archivo de documentación
+├── WebhookListener.csproj      <-- Archivo de configuración del proyecto .NET
+├── Program.cs                  <-- Punto de entrada del backend y definición de endpoints
+├── TradingBotDbContext.cs      <-- Contexto de base de datos de Entity Framework Core
+├── Dockerfile                  <-- Receta de Docker para empaquetar el backend
+├── .env                        <-- Variables de entorno locales (Base de datos, JWT, API Keys)
+├── .env.example                <-- Plantilla de variables de entorno públicas
+│
+├── Features/                   <-- Módulos de la arquitectura del backend
+│   └── Webhooks/
+│       ├── CapitalComService.cs   <-- Cliente de integración con la API de Capital.com
+│       ├── CapitalComSyncWorker.cs <-- Worker periódico en segundo plano
+│       ├── ReceiveWebhookEndpoint.cs <-- Endpoint REST que recibe las alertas de TradingView
+│       ├── SystemLog.cs           <-- Modelo de logs de auditoría interna
+│       ├── Trade.cs               <-- Modelo de registros de operaciones ejecutadas
+│       ├── TradeHub.cs            <-- Hub de SignalR para envío de métricas en tiempo real
+│       └── WebhookModels.cs       <-- Estructuras de datos de entrada (JSON Payloads)
+│
+├── Middleware/                 <-- Controladores de flujos y excepciones
+│   └── GlobalExceptionMiddleware.cs
+│
+├── Migrations/                 <-- Scripts autogenerados por EF Core para PostgreSQL
+│
+└── dashboard/                  <-- Proyecto frontend React
+    ├── package.json
+    ├── tailwind.config.js
+    ├── src/
+    │   ├── main.tsx
+    │   ├── App.tsx
+    │   ├── context/            <-- Proveedores de estado global (auth, SignalR)
+    │   ├── utils/              <-- Formateadores y APIs de conexión
+    │   ├── types/              <-- Tipados TypeScript para datos de trades y logs
+    │   └── views/              <-- Vistas y componentes del panel de control
+
+--------------------------------------------------------------------------------
+5. DETALLE DE LA ESTRATEGIA CUANTITATIVA Y SOLUCIÓN DE VULNERABILIDADES
+--------------------------------------------------------------------------------
+
+A. FORMULACIÓN MATEMÁTICA DEL HIDDEN MARKOV MODEL (HMM)
+   Para evitar el ruido en canales laterales, el script implementa un modelo analítico matricial recursivo que asume 2 regímenes de mercado:
+     - Régimen 0 (Baja volatilidad / Rango plano).
+     - Régimen 1 (Alta volatilidad / Tendencia expansiva).
+
+   Fórmula de Observación (Retorno Logarítmico Estandarizado):
+     R_t = (ln(C_t / C_{t-1}) - μ) / σ
+     Donde el promedio (μ) y la desviación estándar (σ) se calculan dinámicamente sobre el periodo parametrizado (hmm_period).
+
+   Autocalibración de Estados y Reducción de Sobreajuste (Overfitting):
+     Para cumplir con las normas cuantitativas de robustez paramétrica (máximo 2-4 variables libres), el 70% de las variables se han quemado en el código (hardcoded) como constantes matemáticas. Las desviaciones estándar del HMM se adaptan dinámicamente respecto a la desviación a largo plazo (200 velas), eliminando variables libres de optimización:
+     - σ0 = LongTermSigma * 0.5 (Estado 0 - Compresión)
+     - σ1 = LongTermSigma * 1.5 (Estado 1 - Expansión)
+
+   Probabilidades de Emisión Gaussiana para cada Estado S_i:
+     P(Obs | S_i) = [1 / (σ_i * sqrt(2π))] * exp( - (R_t - μ_i)^2 / (2 * σ_i^2) )
+
+   Matriz de Transición de Probabilidades (Fija):
+     A = [ p00  p01 ] = [ 0.85  0.15 ]
+         [ p10  p11 ]   [ 0.20  0.80 ]
+
+   Algoritmo Forward (Actualización de Probabilidades):
+     f0_new = emit0 * (f0 * p00 + f1 * p10)
+     f1_new = emit1 * (f0 * p01 + f1 * p11)
+     sum_f = f0_new + f1_new
+     - f0 = f0_new / sum_f
+     - f1 = f1_new / sum_f
+
+B. MÓDULO DE ENTRADA: DARVAS BOX RETEST MEDIANTE ÓRDENES LÍMITE (0 LAG)
+   - El canal de consolidación se define mediante el máximo y mínimo móvil de los últimos periodos (`darvas_period = 10`), con desfase de 1 vela `[1]` para evitar lookahead bias en el gráfico.
+   - Ruptura: Ocurre cuando la vela actual cruza los niveles superior/inferior.
+   - Orden Límite en TradingView: Al ocurrir una ruptura en TradingView, el script no espera confirmación de cierre de vela. Coloca una orden pendiente **BUY LIMIT** en el techo roto (o **SELL LIMIT** en el suelo roto):
+     `strategy.entry("Long_Trade", strategy.long, limit=retest_level, qty=qty, ...)`
+   - **Análisis de Latencia y Jerarquía de Estados:** TradingView actúa como el **Maestro de Estados de Salida**. Si colocáramos la orden límite directamente en el libro de órdenes del broker real antes de que se llene en TradingView, TradingView nunca sabría cuándo fue ejecutada (ya que Pine Script no tiene APIs de entrada para recibir notificaciones del broker). Al no registrar el llenado, TradingView no activaría su motor interno de exits (Break-Even a 1:1, Trailing ATR dinámico, protección diaria). Por ende, para que TV gestione las salidas, la orden límite se simula en TradingView; al ejecutarse la orden virtual, TradingView envía inmediatamente el webhook de compra/venta a C#, el cual lanza una orden a mercado en Capital.com. La latencia de red (milisegundos) se minimiza usando servidores en la nube y optimización de sockets.
+   - Cancelación de Límites Obsoletos: Si el precio no regresa a retestear el nivel en menos de 15 velas (`darvas_max_retest_bars`), el script cancela la orden pendiente para evitar que se ejecute una señal vieja.
+
+C. VALOR DINÁMICO DEL PIP Y CONVERSOR DE CONTRATOS (UNIVERSAL)
+   Para poder operar Forex en JPY o cruces complejos, oro o materias primas sin que el riesgo de tu capital del 1% varíe:
+     qty_units = CapitalArriesgado / (DistanciaStopPips * syminfo.pipvalue)
+     lotes = qty_units / syminfo.contractsize
+
+D. SOLUCIÓN A LA SERIALIZACIÓN JSON Y NULOS EN C#
+   - Para evitar excepciones de mapeo `JsonException` o `FormatException` en el backend al enviar nulos (ej: en cierres o trailing stop sin Take Profit), el DTO de C# (`WebhookRequest`) define todos los campos numéricos como anulables (`decimal? StopLoss`, `decimal? TakeProfit`). 
+   - El backend maneja de forma segura las variables mediante `.GetValueOrDefault()`.
+   - En Pine Script, la función `f_build_json` concatena el literal `null` de JSON (sin comillas) cuando una variable tiene el valor `na`.
+
+E. EVITAR ÓRDENES DUPLICADAS (IDEMPOTENCIA POR `trade_id`)
+   - En Pine Script, el webhook incluye un identificador de transacción único `"trade_id"` generado dinámicamente combinando el Ticker, el número mágico del módulo y la marca de tiempo de la vela:
+     `trade_id = Ticker_MagicNumber_Time`
+   - En C# (`ReceiveWebhookEndpoint.cs`), se almacena cada `trade_id` procesado en una caché en memoria thread-safe (`ConcurrentDictionary<string, bool>`). Antes de pasar la orden a ejecución, el backend valida si el ID ya existe; si es duplicado (causado por reintentos de red), se ignora de inmediato el payload devolviendo `200 OK`.
+
+F. PROTECCIÓN DE APERTURA DUPLICADA EN BROKER (PREVENCIÓN DE SOBREEXPOSICIÓN)
+   - Adicionalmente a la validación de idempotencia, el backend en C# realiza una consulta en la base de datos PostgreSQL antes de abrir una operación.
+   - Si se recibe una alerta de compra/venta (`BUY` / `SELL`) pero la base de datos detecta que ya existe una posición con estado `"OPEN"` para ese mismo símbolo y estrategia, la orden es abortada preventivamente. Esto evita acumular posiciones paralelas por desincronización.
+
+--------------------------------------------------------------------------------
+6. DETALLE DEL WEBHOOK LISTENER Y PROTOCOLOS DE PRODUCCIÓN
+--------------------------------------------------------------------------------
+
+A. PROTECCIÓN CONTRA SPREAD DINÁMICO EN BROKER
+   - Se removió el control de spread máximo del código de TradingView porque la plataforma opera con datos estáticos e idealizados.
+   - **Protocolo de Producción (Backend):** Cuando el microservicio recibe la señal de compra/venta del Webhook de TradingView, antes de enviar la orden de ejecución a Capital.com realiza una llamada de consulta rápida del libro de órdenes (*order book*) de Capital.com para verificar el spread real de mercado. Si el spread real en ese microsegundo es superior al spread máximo permitido, el backend rechaza la orden y registra el log correspondiente de bloqueo preventivo.
+
+B. CONCILIACIÓN AUTOMÁTICA DE ESTADO
+   - Si la posición es cerrada manualmente por el usuario desde el panel del broker o salta el Stop Loss físico, el `CapitalComSyncWorker` en segundo plano actualiza la base de datos PostgreSQL a `"CLOSED"`.
+   - Si TradingView envía tardíamente un webhook de cierre (`CLOSE`) sobre un trade ya cerrado en el broker, el backend intercepta la llamada, actualiza la base de datos local y devuelve un código de éxito `200 OK` al webhook de TradingView sin lanzar errores ni intentar cerrar órdenes inexistentes en Capital.com.
+
+--------------------------------------------------------------------------------
+7. INTERFAZ GRÁFICA (REACT DASHBOARD)
+--------------------------------------------------------------------------------
+El panel frontal permite monitorear visualmente el bot sin tener que entrar al servidor VPS:
+1. Conexión SignalR: Al iniciar, el frontend solicita un JWT del backend y abre un WebSocket contra `/tradehub`.
+2. Telemetría de Cuenta: Muestra en gráficos dinámicos el Balance, Equidad, Margen Utilizado y Porcentaje de Drawdown del día.
+3. Tabla de Posiciones Activas: Muestra el precio de entrada, Stop Loss activo, Take Profit activo y PnL flotante real.
+4. Historial de Operaciones: Muestra la lista de trades cerrados en PostgreSQL indicando fecha, símbolo, lotaje y PnL de salida.
+5. Consola de Logs: Muestra las líneas de auditoría en vivo para verificar que el webhook reciba señales y que Capital.com ejecute correctamente.
+
+--------------------------------------------------------------------------------
+8. TUTORIAL Y GUÍA DE DESPLIEGUE EN PRODUCCIÓN (PASO A PASO)
+--------------------------------------------------------------------------------
+
+Sigue estos pasos detallados para poner en marcha, optimizar y migrar el bot a cuenta real de forma segura.
+
+FASE 1: OPTIMIZACIÓN Y VALIDACIÓN MATEMÁTICA (TRADINGVIEW)
+1. Carga el gráfico de la divisa elegida (por ejemplo, EURUSD o GBPUSD) en la temporalidad deseada (se sugieren gráficos de 15m, 30m o 1h).
+2. Abre el **Pine Editor**, pega el código de [codigo_pine_hmm_v6.txt](file:///file:///home/kevin/VSCodeProject%20/TradingBot/WebhookListener/codigo_pine_hmm_v6.txt) y haz clic en **Guardar**.
+3. **Prueba Out-of-Sample (OOS):**
+   * Configura las propiedades del Backtesting en TradingView para limitar el rango de fecha.
+   * Optimiza las variables libres (`hmm_period` de 10 a 30, `darvas_period` de 5 a 15, `darvas_rrr` de 2.0 a 4.0) únicamente en el histórico de datos del año 2020 al 2024 (In-Sample).
+   * Una vez encuentres la configuración óptima, cambia las fechas en el gráfico para evaluar el rendimiento en el periodo restante (OOS: del 2024 al presente) utilizando exactamente los mismos parámetros.
+   * **Regla de supervivencia:** Si la ganancia neta en OOS mantiene al menos el 50% de la eficiencia del periodo inicial (WFE > 50%), el modelo es robusto. Si la curva colapsa, la configuración está sobreajustada y debes descartarla.
+
+FASE 2: CONFIGURACIÓN DEL SERVIDOR VPS EN LA NUBE (PRODUCCIÓN)
+Tu servidor en la nube ya tiene corriendo la aplicación, por lo que los pasos de conexión y despliegue son consistentes.
+1. Abre tu terminal de servidor VPS o accede a tu entorno en la nube.
+2. Asegúrate de configurar los parámetros en el archivo `.env` en la raíz del proyecto backend:
+   * `CONNECTION_STRING`: Cadena de conexión para PostgreSQL.
+   * `JWT_SECRET_KEY`: Llave de seguridad de 256 bits para firmar tokens del webhook y dashboard.
+   * `CAPITALCOM_API_KEY`, `CAPITALCOM_IDENTIFIER`, `CAPITALCOM_PASSWORD`: Tus credenciales de Capital.com.
+   * `CAPITALCOM_API_URL`: Dirección de la API (Demo: `https://demo-api-capital.backend-capital.com/api/v1` / Cuenta Real: `https://api-capital.backend-capital.com/api/v1`).
+3. Levanta los servicios dockerizados con Docker Compose:
+   ```bash
+   docker-compose up -d --build
+   ```
+4. Caddy creará automáticamente el certificado Let's Encrypt SSL para tu subdominio (ej. `https://bot.kvstudio.me`).
+
+FASE 3: CREACIÓN DE ALERTAS EN TRADINGVIEW
+1. Asegúrate de que las fechas del filtro de noticias macro en los inputs de tu gráfico estén actualizadas o, en su defecto, desactiva la casilla "Habilitar Filtro de Noticias Macro" en TradingView para un funcionamiento 24/7 sin bloqueos de noticias pasadas.
+2. En tu gráfico de TradingView, presiona `Alt + A` para crear una nueva alerta.
+3. Elige como condición la estrategia: **Estrategia Cuantitativa Avanzada HMM v6**.
+4. En **URL del Webhook**, marca la casilla y escribe tu endpoint TLS seguro:
+   `https://bot.kvstudio.me/api/v1/webhook`
+5. En la caja de **Mensaje**, borra todo y pega **exclusivamente**:
+   `{{strategy.order.alert_message}}`
+6. Guarda la alerta. A partir de este momento, cada vez que TradingView ejecute una orden límite o la cierre, enviará el JSON firmado hacia tu VPS, el cual registrará la operación en PostgreSQL, actualizará tu Dashboard React en tiempo real y ruteará la orden a Capital.com.
+
+FASE 4: MIGRACIÓN DE CUENTA DEMO A CUENTA REAL
+Para pasar el sistema de operaciones simuladas (Demo) a operaciones con capital real en el broker Capital.com, **no necesitas cambiar tu código de Pine Script ni reescribir tu aplicación C#**. Los pasos son los siguientes:
+1. Accede a tu portal de Capital.com y crea tu API Key para la cuenta real.
+2. En la terminal de tu servidor VPS en la nube, edita el archivo de configuración `.env`:
+   * Cambia `CAPITALCOM_IDENTIFIER` y `CAPITALCOM_PASSWORD` con tus datos de acceso real.
+   * Reemplaza `CAPITALCOM_API_KEY` por tu nueva API Key de cuenta real.
+   * Cambia la URL `CAPITALCOM_API_URL` a la URL del entorno de producción de Capital.com:
+     `https://api-capital.backend-capital.com/api/v1`
+3. Reinicia el contenedor de docker para aplicar los cambios de variables de entorno:
+   ```bash
+   docker-compose down && docker-compose up -d
+   ```
+4. **Verificación:** Accede al dashboard de control en tu nube. Verifica que la telemetría del balance y margen muestre las métricas correctas de tu cuenta real y que el hosted service (`CapitalComSyncWorker`) se sincronice de forma limpia. El sistema estará listo para operar dinero real inmediatamente sin pasos adicionales.
+
+================================================================================
+FIN DEL DOCUMENTO
+================================================================================

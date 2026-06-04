@@ -1,0 +1,445 @@
+//@version=6
+strategy("Estrategia Cuantitativa Avanzada HMM v6", overlay=true, initial_capital=10000, slippage=3, margin_long=3.33, margin_short=3.33, close_entries_rule="ANY")
+
+// ==========================================
+// 1. PARÁMETROS DE ENTRADA (INPUTS - REDUCIDOS PARA EVITAR SOBREAJUSTE)
+// ==========================================
+
+// --- Gestión de Capital y Operativa ---
+risk_pct        = input.float(1.0, "Porcentaje de Riesgo por Operación (%)", minval=0.1, maxval=5.0, step=0.1, group="Gestión de Capital")
+max_daily_loss  = input.float(3.0, "Límite de Drawdown Diario (%)", minval=0.1, maxval=10.0, step=0.1, group="Gestión de Capital")
+max_daily_trades = input.int(3, "Máximo de Operaciones Diarias", minval=1, maxval=10, group="Gestión de Capital")
+
+// --- Parámetros HMM a Optimizar (Máximo 2-4 variables libres en total) ---
+hmm_period    = input.int(20, "Periodo de Optimización HMM", minval=5, group="Hidden Markov Model")
+darvas_period = input.int(10, "Periodo de la Caja Darvas", minval=3, group="Módulo Darvas Box")
+darvas_rrr    = input.float(2.0, "Ratio Riesgo/Beneficio Mínimo (1:X)", minval=2.0, group="Módulo Darvas Box")
+
+// --- Filtros Operativos Estáticos ---
+ny_session    = input.session("0600-1200:23456", "Sesión de Alta Liquidez (Nueva York)", group="Filtros de Control")
+
+// --- Parámetros de Noticias (Visuales / Alertas - No bloqueantes para autonomía) ---
+enable_news_filter = input.bool(true, "Habilitar Filtro de Noticias Macro", group="Filtro de Noticias")
+news_daily_session = input.session("", "Horario Diario Bloqueo de Noticias", group="Filtro de Noticias")
+news1_start = input.time(timestamp("2026-06-05 08:30 -0400"), "Noticia 1: Inicio", group="Filtro de Noticias")
+news1_end   = input.time(timestamp("2026-06-05 09:00 -0400"), "Noticia 1: Fin", group="Filtro de Noticias")
+news2_start = input.time(timestamp("2026-06-10 14:00 -0400"), "Noticia 2: Inicio", group="Filtro de Noticias")
+news2_end   = input.time(timestamp("2026-06-10 14:30 -0400"), "Noticia 2: Fin", group="Filtro de Noticias")
+news3_start = input.time(timestamp("2026-06-18 14:00 -0400"), "Noticia 3: Inicio", group="Filtro de Noticias")
+news3_end   = input.time(timestamp("2026-06-18 14:30 -0400"), "Noticia 3: Fin", group="Filtro de Noticias")
+
+
+// ==========================================
+// PARÁMETROS HARDCODED (Quemados en el código para evitar Curve-Fitting)
+// ==========================================
+hmm_long_period         = 200   // Periodo de volatilidad a largo plazo para calibración
+mu0                     = 0.0   // Media esperada Estado 0 (Compresión)
+sigma0_mult             = 0.5   // Multiplicador de volatilidad Estado 0
+mu1                     = 0.0   // Media esperada Estado 1 (Expansión)
+sigma1_mult             = 1.5   // Multiplicador de volatilidad Estado 1
+darvas_max_retest_bars  = 15    // Límite de velas para que el precio retestee la caja
+estimated_spread        = 1.5   // Spread base estimado (usado para calcular SL/TP teóricos)
+buffer_pips             = 2.0   // Buffer adicional para colocar el SL estructural
+min_sl_pips             = 5.0   // Stop Loss mínimo para evitar ruido y ejecuciones fantasma
+enable_trailing         = true  // Activar Trailing Stop ATR dinámico
+trailing_activation_rrr = 1.5   // Hito de RRR para activar el Trailing ATR
+trailing_distance_atr   = 1.5   // Distancia de stop dinámico medida en ATR
+
+
+// ==========================================
+// 2. CÁLCULO DE INDICADORES EN FLUJO GLOBAL (AISLAMIENTO HISTÓRICO)
+// ==========================================
+
+atr14 = ta.atr(14)
+
+// Caja Darvas con 0 lag (Excluyendo la vela actual para evitar lookahead bias)
+darvas_top = ta.highest(high, darvas_period)[1]
+darvas_bottom = ta.lowest(low, darvas_period)[1]
+
+// Extremos estructurales locales (Calculados globalmente para evitar fallos de compilación)
+lowest_low_darvas = ta.lowest(low, darvas_period)
+highest_high_darvas = ta.highest(high, darvas_period)
+
+// Determinación del tamaño de un Pip según el activo
+f_pip_size() =>
+    isFractional = (syminfo.mintick == 0.00001 or syminfo.mintick == 0.001)
+    isFractional ? syminfo.mintick * 10 : syminfo.mintick
+
+pip_size = f_pip_size()
+
+// Formateo del precio para cadenas de texto JSON
+f_format_price(val) =>
+    na(val) ? "null" :
+     syminfo.mintick == 0.00001 ? str.tostring(val, "#.#####") :
+     syminfo.mintick == 0.0001  ? str.tostring(val, "#.####") :
+     syminfo.mintick == 0.001   ? str.tostring(val, "#.###") :
+     syminfo.mintick == 0.01    ? str.tostring(val, "#.##") :
+     str.tostring(val)
+
+// Construcción del Payload JSON estricto
+f_build_json(action, ticker, lot, entry, sl, tp, strategy_name, magic, ts) =>
+    p1 = "{\"action\": \"" + action + "\", \"symbol\": \"" + ticker + "\", "
+    p2 = "\"lot_size\": " + (na(lot) ? "null" : str.tostring(lot, "#.##")) + ", "
+    p3 = "\"entry_price\": " + f_format_price(entry) + ", "
+    p4 = "\"stop_loss\": " + f_format_price(sl) + ", "
+    p5 = "\"take_profit\": " + f_format_price(tp) + ", "
+    p6 = "\"strategy\": \"" + strategy_name + "\", "
+    p7 = "\"magic_number\": " + (na(magic) ? "null" : str.tostring(magic)) + ", "
+    p8 = "\"trade_id\": \"" + ticker + "_" + (na(magic) ? "0" : str.tostring(magic)) + "_" + str.tostring(time) + "\", "
+    p9 = "\"timestamp\": " + (na(ts) ? "null" : str.tostring(ts)) + "}"
+    p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9
+
+// Cálculo dinámico de SL y TP
+f_calc_sl_tp(entry_price, sl_raw, is_long, rrr_val) =>
+    sl_dist = is_long ? entry_price - sl_raw : sl_raw - entry_price
+    sl_dist := math.max(sl_dist, 0.0)
+    sl_dist_pips = (sl_dist / pip_size) + estimated_spread
+    final_sl_dist_pips = math.max(sl_dist_pips, min_sl_pips)
+    
+    final_sl = is_long ? entry_price - final_sl_dist_pips * pip_size : entry_price + final_sl_dist_pips * pip_size
+    final_tp = is_long ? entry_price + final_sl_dist_pips * rrr_val * pip_size : entry_price - final_sl_dist_pips * rrr_val * pip_size
+    [final_sl, final_tp]
+
+// Cálculo dinámico de Lote (Universal, soporta cualquier cruce o metal usando syminfo.pipvalue y syminfo.contractsize)
+f_calculate_position_size(entry_price, sl_price) =>
+    sl_dist = math.abs(entry_price - sl_price)
+    sl_dist_pips = sl_dist / pip_size
+    if sl_dist_pips <= 0
+        [0.0, 0.0]
+    else
+        loss_amount = strategy.equity * (risk_pct / 100.0)
+        qty_units = loss_amount / (sl_dist_pips * syminfo.pipvalue)
+        
+        contract_size = syminfo.contractsize
+        final_lot = math.max(0.01, math.round(qty_units / contract_size, 2))
+        final_qty = final_lot * contract_size
+        [final_qty, final_lot]
+
+
+// ==========================================
+// 3. MODELADO MATEMÁTICO: HIDDEN MARKOV MODEL (HMM) DE 2 ESTADOS
+// ==========================================
+
+log_ret = math.log(close / close[1])
+
+// Media y Desviación Estándar dinámicas de la ventana del HMM
+hmm_mu = ta.sma(log_ret, hmm_period)
+hmm_sigma = ta.stdev(log_ret, hmm_period)
+
+// Desviaciones estándar dinámicas autocalibradas basadas en volatilidad a largo plazo (Evita overfitting)
+long_term_sigma = ta.stdev(log_ret, hmm_long_period)
+long_term_sigma_safe = na(long_term_sigma) or long_term_sigma == 0 ? 0.00001 : long_term_sigma
+sigma0 = math.max(long_term_sigma_safe * sigma0_mult, 0.00001)
+sigma1 = math.max(long_term_sigma_safe * sigma1_mult, 0.00001)
+
+// Rendimiento estandarizado (Observación R_t)
+R_t = (log_ret - hmm_mu) / (hmm_sigma == 0 ? 0.00001 : hmm_sigma)
+
+// Probabilidades de emisión asumiendo distribuciones Gaussianas independientes
+emit0 = (1.0 / (sigma0 * math.sqrt(2 * math.pi))) * math.exp(-math.pow(R_t - mu0, 2) / (2 * math.pow(sigma0, 2)))
+emit1 = (1.0 / (sigma1 * math.sqrt(2 * math.pi))) * math.exp(-math.pow(R_t - mu1, 2) / (2 * math.pow(sigma1, 2)))
+
+// Matriz de probabilidad de transición A
+p00 = 0.85
+p01 = 0.15
+p10 = 0.20
+p11 = 0.80
+
+// Variables de estado recursivas del Forward Algorithm (con manejo de na)
+var float f0 = 0.5
+var float f1 = 0.5
+
+f0_new = not na(emit0) and not na(f0) and not na(f1) ? emit0 * (f0 * p00 + f1 * p10) : na
+f1_new = not na(emit1) and not na(f0) and not na(f1) ? emit1 * (f0 * p01 + f1 * p11) : na
+sum_f = na(f0_new) or na(f1_new) ? na : f0_new + f1_new
+
+if not na(sum_f) and sum_f > 0
+    f0 := f0_new / sum_f
+    f1 := f1_new / sum_f
+else
+    f0 := 0.5
+    f1 := 0.5
+
+// Clasificación de Regímenes HMM
+hmm_regime = f1 > f0 ? 1 : 0
+hmm_expansion_active = (hmm_regime == 1)
+
+
+// ==========================================
+// 4. FILTROS OPERATIVOS Y CONTROL DE DRAWDOWN
+// ==========================================
+
+is_ny_session = not na(time(timeframe.period, ny_session))
+
+in_news_blackout = false
+if enable_news_filter
+    if news_daily_session != "" and not na(time(timeframe.period, news_daily_session))
+        in_news_blackout := true
+    if (time >= news1_start and time <= news1_end) or (time >= news2_start and time <= news2_end) or (time >= news3_start and time <= news3_end)
+        in_news_blackout := true
+
+news_expired = time > news3_end
+
+// Control de Drawdown Diario (Circuit Breaker)
+is_new_day = ta.change(time("D")) != 0
+var float daily_start_equity = na
+if is_new_day or na(daily_start_equity)
+    daily_start_equity := strategy.equity
+
+daily_pnl = strategy.equity - daily_start_equity
+daily_loss_limit_reached = daily_pnl < - (daily_start_equity * (max_daily_loss / 100.0))
+
+// Registro de operaciones diarias
+var int daily_trade_count = 0
+if is_new_day
+    daily_trade_count := 0
+
+is_new_trade_opened = (strategy.position_size != 0 and (na(strategy.position_size[1]) or strategy.position_size[1] == 0))
+if is_new_trade_opened
+    daily_trade_count := daily_trade_count + 1
+
+daily_trades_limit_reached = daily_trade_count >= max_daily_trades
+
+// Diagnóstico de Rechazo
+var string last_rejection_reason = "Ninguno"
+if not hmm_expansion_active
+    last_rejection_reason := "HMM: Régimen de Compresión (Bloqueado)"
+else if not is_ny_session
+    last_rejection_reason := "Horario: Fuera de Sesión NY"
+else if daily_loss_limit_reached
+    last_rejection_reason := "Drawdown: Límite Pérdidas Diario Alcanzado"
+else if daily_trades_limit_reached
+    last_rejection_reason := "Trades: Límite Operaciones Diarias Alcanzado"
+else if in_news_blackout
+    last_rejection_reason := "Noticias: Bloqueo de Noticias Macro"
+
+
+// ==========================================
+// 5. ESTRATEGIA DE ENTRADA: DARVAS BOX RETEST MEDIANTE ÓRDENES LÍMITE (0 LAG)
+// ==========================================
+
+// Matriz de señales permitidas
+allowed_to_enter = hmm_expansion_active and is_ny_session and not daily_loss_limit_reached and not daily_trades_limit_reached and not in_news_blackout and (strategy.opentrades == 0)
+
+var bool waiting_retest_long = false
+var bool waiting_retest_short = false
+var float retest_level = na
+var int retest_bars_counter = 0
+
+// Detección de Rupturas en flujo global (Evita warnings y lag de pivotes)
+darvas_crossover = ta.crossover(close, darvas_top)
+darvas_crossunder = ta.crossunder(close, darvas_bottom)
+
+// Al ocurrir una ruptura, se cancelan límites anteriores y se configuran los nuevos niveles de retest
+if darvas_crossover and (strategy.opentrades == 0)
+    waiting_retest_long := true
+    waiting_retest_short := false
+    retest_level := darvas_top
+    retest_bars_counter := 0
+
+if darvas_crossunder and (strategy.opentrades == 0)
+    waiting_retest_long := false
+    waiting_retest_short := true
+    retest_level := darvas_bottom
+    retest_bars_counter := 0
+
+// Cancelación de órdenes pendientes en TradingView si expira el tiempo de retesteo
+if waiting_retest_long or waiting_retest_short
+    retest_bars_counter := retest_bars_counter + 1
+    if retest_bars_counter > darvas_max_retest_bars
+        strategy.cancel("Long_Trade")
+        strategy.cancel("Short_Trade")
+        waiting_retest_long := false
+        waiting_retest_short := false
+
+
+// ==========================================
+// 6. EJECUCIÓN DE ENTRADAS Y REGISTRO DE VARIABLES DE ESTADO
+// ==========================================
+
+var float active_calculated_sl = na
+var float active_calculated_tp = na
+var float active_lot = na
+var string active_strat = ""
+var int active_magic = 0
+var string active_entry_id = ""
+var float active_raw_sl_dist_pips = na
+var float trade_peak = na
+var bool trailing_active = false
+var bool prev_trailing_active = false
+var bool break_even_active = false
+bool trade_opened_this_bar = false
+
+// Resetear flags de retesteo al estar dentro de una posición activa
+if strategy.position_size != 0
+    waiting_retest_long := false
+    waiting_retest_short := false
+
+// Colocar orden LIMIT en el nivel exacto de retest al ocurrir la ruptura
+if allowed_to_enter
+    if waiting_retest_long and not na(retest_level)
+        raw_sl = lowest_low_darvas
+        [sl, tp] = f_calc_sl_tp(retest_level, raw_sl, true, darvas_rrr)
+        [qty, lot] = f_calculate_position_size(retest_level, sl)
+        if lot > 0
+            active_calculated_sl := sl
+            active_calculated_tp := tp
+            active_lot := lot
+            active_strat := "Darvas Box"
+            active_magic := 1001
+            active_entry_id := "Long_Trade"
+            active_raw_sl_dist_pips := math.abs(retest_level - raw_sl) / pip_size
+            trade_peak := retest_level
+            trailing_active := false
+            break_even_active := false
+            trade_opened_this_bar := true
+
+            dynamic_magic = active_magic * 1000 + daily_trade_count
+            entry_alert_msg = f_build_json("BUY", syminfo.ticker, lot, retest_level, sl, tp, active_strat, dynamic_magic, time)
+            strategy.entry("Long_Trade", strategy.long, limit=retest_level, qty=qty, alert_message=entry_alert_msg)
+            
+    else if waiting_retest_short and not na(retest_level)
+        raw_sl = highest_high_darvas
+        [sl, tp] = f_calc_sl_tp(retest_level, raw_sl, false, darvas_rrr)
+        [qty, lot] = f_calculate_position_size(retest_level, sl)
+        if lot > 0
+            active_calculated_sl := sl
+            active_calculated_tp := tp
+            active_lot := lot
+            active_strat := "Darvas Box"
+            active_magic := 1002
+            active_entry_id := "Short_Trade"
+            active_raw_sl_dist_pips := math.abs(raw_sl - retest_level) / pip_size
+            trade_peak := retest_level
+            trailing_active := false
+            break_even_active := false
+            trade_opened_this_bar := true
+
+            dynamic_magic = active_magic * 1000 + daily_trade_count
+            entry_alert_msg = f_build_json("SELL", syminfo.ticker, lot, retest_level, sl, tp, active_strat, dynamic_magic, time)
+            strategy.entry("Short_Trade", strategy.short, limit=retest_level, qty=qty, alert_message=entry_alert_msg)
+
+
+// ==========================================
+// 7. GESTIÓN DINÁMICA DE SALIDAS (TRAILING & VALIDATION)
+// ==========================================
+
+if strategy.position_size != 0
+    is_long_trade = strategy.position_size > 0
+    entry_price_val = strategy.opentrades.entry_price(0)
+    
+    if na(trade_peak)
+        trade_peak := entry_price_val
+        trailing_active := false
+        break_even_active := false
+    else
+        trade_peak := is_long_trade ? math.max(trade_peak, high) : math.min(trade_peak, low)
+    
+    // Recálculo del SL estructurado
+    actual_raw_sl = entry_price_val + (is_long_trade ? -1 : 1) * active_raw_sl_dist_pips * pip_size
+    [sl_level, tp_level] = f_calc_sl_tp(entry_price_val, actual_raw_sl, is_long_trade, darvas_rrr)
+    
+    if na(active_calculated_sl)
+        active_calculated_sl := sl_level
+        active_calculated_tp := tp_level
+        
+    // Lógica Break-Even (Hito RRR 1:1)
+    initial_sl_dist = math.abs(entry_price_val - actual_raw_sl)
+    be_trigger_price = entry_price_val + (is_long_trade ? 1 : -1) * initial_sl_dist
+    
+    if not break_even_active and (is_long_trade ? high >= be_trigger_price : low <= be_trigger_price)
+        break_even_active := true
+        
+    float base_sl_level = active_calculated_sl
+    if break_even_active
+        be_sl_price = entry_price_val + (is_long_trade ? 1 : -1) * estimated_spread * pip_size
+        base_sl_level := is_long_trade ? math.max(active_calculated_sl, be_sl_price) : math.min(active_calculated_sl, be_sl_price)
+        
+    // Hito de Activación Trailing Stop
+    milestone = entry_price_val + (is_long_trade ? 1 : -1) * initial_sl_dist * trailing_activation_rrr
+    
+    if enable_trailing and not trailing_active and (is_long_trade ? high >= milestone : low <= milestone)
+        trailing_active := true
+        
+    float trail_sl_level = na
+    if enable_trailing and trailing_active
+        trail_sl_level := is_long_trade ? trade_peak - atr14 * trailing_distance_atr : trade_peak + atr14 * trailing_distance_atr
+        
+    float final_sl_level = base_sl_level
+    if enable_trailing and trailing_active and not na(trail_sl_level)
+        if is_long_trade
+            final_sl_level := math.max(base_sl_level, trail_sl_level)
+        else
+            final_sl_level := math.min(base_sl_level, trail_sl_level)
+            
+    active_calculated_sl := final_sl_level
+    
+    // Anulación del TP estático tras activar trailing stop agresivo
+    exit_limit_level = (enable_trailing and trailing_active) ? na : active_calculated_tp
+    
+    isValidExit = not na(final_sl_level) and final_sl_level > 0
+    if not na(exit_limit_level)
+        isValidExit := isValidExit and exit_limit_level > 0 and final_sl_level != exit_limit_level
+        
+    sl_dist_actual_pips = math.abs(entry_price_val - final_sl_level) / pip_size
+    isValidExit := isValidExit and (sl_dist_actual_pips >= min_sl_pips)
+    
+    if isValidExit
+        dynamic_magic = active_magic * 1000 + daily_trade_count
+        exit_alert_msg = f_build_json("CLOSE", syminfo.ticker, active_lot, entry_price_val, final_sl_level, exit_limit_level, active_strat, dynamic_magic, time)
+        strategy.exit("Exit_Position", from_entry=active_entry_id, stop=final_sl_level, limit=exit_limit_level, alert_message=exit_alert_msg)
+            
+    prev_trailing_active := trailing_active
+
+// Resetear variables al cerrarse la posición
+is_position_just_closed = (strategy.position_size == 0 and strategy.position_size[1] != 0)
+if is_position_just_closed and not trade_opened_this_bar
+    active_calculated_sl := na
+    active_calculated_tp := na
+    active_lot := na
+    active_strat := ""
+    active_magic := 0
+    active_entry_id := ""
+    active_raw_sl_dist_pips := na
+    trade_peak := na
+    trailing_active := false
+    prev_trailing_active := false
+    break_even_active := false
+
+// Alertas gestionadas a través del parámetro alert_message en strategy.entry y strategy.exit para evitar duplicidades
+
+
+// ==========================================
+// 8. GRÁFICOS Y CONSOLA DE AUDITORÍA VISUAL
+// ==========================================
+
+bgcolor(hmm_expansion_active ? color.new(color.green, 97) : color.new(color.red, 97), title="Régimen HMM (Verde=Exp, Rojo=Comp)")
+
+plot(strategy.position_size != 0 ? active_calculated_sl : na, color=color.red, style=plot.style_linebr, linewidth=2, title="Stop Loss Activo")
+plot(strategy.position_size != 0 and not na(active_calculated_tp) ? active_calculated_tp : na, color=color.green, style=plot.style_linebr, linewidth=2, title="Take Profit Activo")
+
+var table audit_table = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 20), border_color=color.black, border_width=1)
+if barstate.islast
+    table.cell(audit_table, 0, 0, "Métrica", text_color=color.yellow, text_size=size.small, bgcolor=color.black)
+    table.cell(audit_table, 1, 0, "Valor", text_color=color.yellow, text_size=size.small, bgcolor=color.black)
+    
+    table.cell(audit_table, 0, 1, "Régimen HMM", text_color=color.white, text_size=size.small)
+    table.cell(audit_table, 1, 1, hmm_expansion_active ? "EXPANSIÓN (1)" : "COMPRESIÓN (0)", text_color=hmm_expansion_active ? color.green : color.red, text_size=size.small)
+    
+    table.cell(audit_table, 0, 2, "Probabilidad Estado 1", text_color=color.white, text_size=size.small)
+    table.cell(audit_table, 1, 2, str.tostring(f1 * 100, "#.##") + "%", text_color=color.aqua, text_size=size.small)
+    
+    table.cell(audit_table, 0, 3, "Trades Diarios", text_color=color.white, text_size=size.small)
+    table.cell(audit_table, 1, 3, str.tostring(daily_trade_count) + " / " + str.tostring(max_daily_trades), text_color=daily_trades_limit_reached ? color.red : color.green, text_size=size.small)
+    
+    table.cell(audit_table, 0, 4, "PnL Diario", text_color=color.white, text_size=size.small)
+    table.cell(audit_table, 1, 4, str.tostring(daily_pnl, "#.##") + " USD", text_color=daily_pnl >= 0 ? color.green : color.red, text_size=size.small)
+    
+    table.cell(audit_table, 0, 5, "Filtro Noticias", text_color=color.white, text_size=size.small)
+    table.cell(audit_table, 1, 5, news_expired and enable_news_filter ? "VENCIDO" : in_news_blackout ? "BLOQUEADO" : "OK", text_color=in_news_blackout or (news_expired and enable_news_filter) ? color.red : color.green, text_size=size.small)
+    
+    table.cell(audit_table, 0, 6, "Estado del Bot", text_color=color.white, text_size=size.small)
+    table.cell(audit_table, 1, 6, strategy.position_size != 0 ? "EN TRADE" : "BÚSQUEDA", text_color=strategy.position_size != 0 ? color.orange : color.green, text_size=size.small)
+    
+    table.cell(audit_table, 0, 7, "Último Rechazo", text_color=color.white, text_size=size.small)
+    table.cell(audit_table, 1, 7, last_rejection_reason, text_color=color.yellow, text_size=size.small)

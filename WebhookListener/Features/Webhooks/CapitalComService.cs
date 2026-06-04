@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.EntityFrameworkCore;
 
 namespace WebhookListener.Features.Webhooks;
 
@@ -177,6 +178,72 @@ public class CapitalComService
     public async Task<WebhookResponse> ExecuteWebhookOrderAsync(WebhookRequest alert)
     {
         _logger.LogInformation("=== INICIO PROCESAMIENTO WEBHOOK ESTRATEGIA: {Strategy} ===", alert.Strategy);
+
+        var isCloseAction = string.Equals(alert.Action, "CLOSE", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(alert.Action, "CANCEL", StringComparison.OrdinalIgnoreCase);
+
+        if (isCloseAction)
+        {
+            _logger.LogInformation("Alerta de CIERRE/CANCELACIÓN recibida para {Symbol} - Estrategia: {Strategy}", alert.Symbol, alert.Strategy);
+
+            // 1. Buscar la posición activa en nuestra DB
+            var activeTrade = await _context.Trades
+                .Where(t => t.Ticker == alert.Symbol && t.Strategy == alert.Strategy && t.Status == "OPEN" && !t.IsDeleted)
+                .OrderByDescending(t => t.CreatedAt)
+                .FirstOrDefaultAsync();
+
+            if (activeTrade == null)
+            {
+                _logger.LogWarning("No se encontró ningún trade activo en PostgreSQL para {Symbol} y estrategia {Strategy} para cerrar.", alert.Symbol, alert.Strategy);
+                return new WebhookResponse(false, "No se encontró ningún trade activo para cerrar.");
+            }
+
+            // 2. Cerrar en Capital.com si tenemos DealReference
+            bool capitalClosed = false;
+            if (!string.IsNullOrEmpty(activeTrade.DealReference))
+            {
+                capitalClosed = await ClosePositionOnCapitalComAsync(activeTrade.DealReference);
+            }
+            else
+            {
+                _logger.LogWarning("El trade activo no tiene DealReference almacenado. Cerrando únicamente en base de datos.");
+            }
+
+            // 3. Actualizar base de datos
+            activeTrade.Status = "CLOSED";
+            activeTrade.ProfitLoss = 0; // Opcional
+            await _context.SaveChangesAsync();
+
+            // 4. Notificar vía SignalR
+            try
+            {
+                await _hubContext.Clients.All.SendAsync("TradeUpdated", activeTrade);
+                _logger.LogInformation("Trade de cierre transmitido vía SignalR.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error al transmitir actualización de cierre por SignalR.");
+            }
+
+            return new WebhookResponse(
+                Success: true,
+                Message: capitalClosed 
+                    ? $"Posición cerrada exitosamente en Capital.com y base de datos para {alert.Symbol}." 
+                    : $"Posición cerrada en base de datos para {alert.Symbol} (no se pudo cerrar en Capital.com)."
+            );
+        }
+        
+        // Validar si ya hay un trade activo en PostgreSQL para evitar duplicar el riesgo
+        var activeTrade = await _context.Trades
+            .Where(t => t.Ticker == alert.Symbol && t.Strategy == alert.Strategy && t.Status == "OPEN" && !t.IsDeleted)
+            .OrderByDescending(t => t.CreatedAt)
+            .FirstOrDefaultAsync();
+
+        if (activeTrade != null)
+        {
+            _logger.LogWarning("Se recibió una señal de APERTURA para {Symbol} con estrategia {Strategy}, pero ya existe una posición activa abierta en PostgreSQL.", alert.Symbol, alert.Strategy);
+            return new WebhookResponse(false, $"Ya existe una posición abierta para {alert.Symbol} con esta estrategia. Orden ignorada para evitar sobreexposición.");
+        }
         
         // 1. Obtener tokens de sesión válidos (reutilización)
         var (cst, securityToken) = await GetSessionTokensAsync();
@@ -186,7 +253,7 @@ public class CapitalComService
 
         // 3. Gestión de Riesgos y Regla del 1%
         var maxRisk = balance * 0.01m; // 1% del saldo líquido
-        var slDistance = Math.Abs(alert.EntryPrice - alert.StopLoss);
+        var slDistance = Math.Abs(alert.EntryPrice.GetValueOrDefault() - alert.StopLoss.GetValueOrDefault());
 
         if (slDistance == 0)
         {
@@ -212,7 +279,7 @@ public class CapitalComService
         }
         else if (alert.Symbol.StartsWith("USD", StringComparison.OrdinalIgnoreCase))
         {
-            calculatedSize = maxRisk * alert.EntryPrice / slDistance;
+            calculatedSize = maxRisk * alert.EntryPrice.GetValueOrDefault() / slDistance;
         }
         else
         {
@@ -264,6 +331,10 @@ public class CapitalComService
 
         _logger.LogInformation("=== ORDEN EN PILOTO AUTOMÁTICO CONFIRMADA. Ref: {DealRef} ===", dealRef);
 
+        // Consultar confirmación para obtener el dealId real
+        var dealId = await GetDealIdFromConfirmAsync(cst, securityToken, dealRef);
+        var dealIdOrRef = dealId ?? dealRef; // Fallback a dealRef si no se confirma
+
         // 5. Guardar el registro en la base de datos PostgreSQL
         var trade = new Trade
         {
@@ -271,13 +342,14 @@ public class CapitalComService
             Ticker = alert.Symbol,
             Strategy = alert.Strategy,
             Direction = alert.Action.Equals("BUY", StringComparison.OrdinalIgnoreCase) ? "BUY" : "SELL",
-            EntryPrice = alert.EntryPrice,
-            StopLoss = alert.StopLoss,
-            TakeProfit = alert.TakeProfit,
+            EntryPrice = alert.EntryPrice.GetValueOrDefault(),
+            StopLoss = alert.StopLoss.GetValueOrDefault(),
+            TakeProfit = alert.TakeProfit.GetValueOrDefault(),
             Size = calculatedSize,
             Status = "OPEN",
             ProfitLoss = null,
-            CreatedAt = DateTime.UtcNow
+            CreatedAt = DateTime.UtcNow,
+            DealReference = dealIdOrRef
         };
 
         await _context.Trades.AddAsync(trade);
@@ -311,5 +383,328 @@ public class CapitalComService
     {
         var (cst, securityToken) = await GetSessionTokensAsync();
         return await GetAccountBalanceAsync(cst, securityToken);
+    }
+
+    /// <summary>
+    /// Cierra una posición abierta en Capital.com usando su DealReference.
+    /// </summary>
+    public async Task<bool> ClosePositionOnCapitalComAsync(string dealReference)
+    {
+        try
+        {
+            var (cst, securityToken) = await GetSessionTokensAsync();
+
+            string dealId = dealReference;
+
+            // Si el identificador parece ser un dealReference de orden (empieza con "o_"), intentamos resolverlo a dealId
+            if (dealReference.StartsWith("o_", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogInformation("El identificador {Identifier} parece ser un dealReference. Resolviendo a dealId...", dealReference);
+                var resolvedId = await GetDealIdFromConfirmAsync(cst, securityToken, dealReference);
+                if (!string.IsNullOrEmpty(resolvedId))
+                {
+                    dealId = resolvedId;
+                    _logger.LogInformation("Resuelto a dealId desde confirms: {DealId}", dealId);
+                }
+                else
+                {
+                    _logger.LogWarning("No se pudo resolver el dealReference {Identifier} a un dealId mediante /confirms. Buscando en posiciones abiertas...", dealReference);
+                    
+                    // Como fallback, intentamos buscar en las posiciones abiertas
+                    var request = new HttpRequestMessage(HttpMethod.Get, $"{_baseUrl}/positions");
+                    request.Headers.Add("X-CAP-API-KEY", _apiKey);
+                    request.Headers.Add("CST", cst);
+                    request.Headers.Add("X-SECURITY-TOKEN", securityToken);
+
+                    var response = await _httpClient.SendAsync(request);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var positionsResponse = await response.Content.ReadFromJsonAsync<CapitalPositionsResponse>();
+                        var targetPosition = positionsResponse?.Positions?
+                            .FirstOrDefault(p => string.Equals(p.Position?.DealReference, dealReference, StringComparison.OrdinalIgnoreCase));
+                        
+                        if (targetPosition?.Position != null)
+                        {
+                            dealId = targetPosition.Position.DealId ?? dealReference;
+                            _logger.LogInformation("Resuelto a dealId desde posiciones abiertas: {DealId}", dealId);
+                        }
+                        else
+                        {
+                            _logger.LogWarning("No se encontró ninguna posición abierta en Capital.com con Identificador: {DealRef}", dealReference);
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Fallo al listar posiciones en Capital.com. Status: {Status}", response.StatusCode);
+                        return false;
+                    }
+                }
+            }
+
+            // Ejecutar el DELETE /positions/{dealId}
+            _logger.LogInformation("Enviando DELETE /positions/{DealId} a Capital.com...", dealId);
+            var deleteRequest = new HttpRequestMessage(HttpMethod.Delete, $"{_baseUrl}/positions/{dealId}");
+            deleteRequest.Headers.Add("X-CAP-API-KEY", _apiKey);
+            deleteRequest.Headers.Add("CST", cst);
+            deleteRequest.Headers.Add("X-SECURITY-TOKEN", securityToken);
+
+            var deleteResponse = await _httpClient.SendAsync(deleteRequest);
+            if (!deleteResponse.IsSuccessStatusCode)
+            {
+                var errContent = await deleteResponse.Content.ReadAsStringAsync();
+                _logger.LogError("Fallo al cerrar posición en Capital.com. Status: {Status}, Content: {Content}", deleteResponse.StatusCode, errContent);
+                return false;
+            }
+
+            _logger.LogInformation("Posición {DealId} (Ref: {DealRef}) cerrada exitosamente en Capital.com.", dealId, dealReference);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Excepción al cerrar posición en Capital.com para Identificador {DealRef}", dealReference);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Consulta el dealId de una posición mediante su dealReference con reintentos.
+    /// </summary>
+    private async Task<string?> GetDealIdFromConfirmAsync(string cst, string securityToken, string dealReference)
+    {
+        for (int i = 0; i < 5; i++)
+        {
+            try
+            {
+                var request = new HttpRequestMessage(HttpMethod.Get, $"{_baseUrl}/confirms/{dealReference}");
+                request.Headers.Add("X-CAP-API-KEY", _apiKey);
+                request.Headers.Add("CST", cst);
+                request.Headers.Add("X-SECURITY-TOKEN", securityToken);
+
+                var response = await _httpClient.SendAsync(request);
+                var rawJson = await response.Content.ReadAsStringAsync();
+                _logger.LogInformation("Confirm API Response for {DealRef}: Status={StatusCode}, Body={Body}", 
+                    dealReference, response.StatusCode, rawJson);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var options = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                    var confirmData = System.Text.Json.JsonSerializer.Deserialize<CapitalConfirmResponse>(rawJson, options);
+                    if (confirmData != null && confirmData.AffectedDeals != null && confirmData.AffectedDeals.Count > 0)
+                    {
+                        var dealId = confirmData.AffectedDeals[0].DealId;
+                        _logger.LogInformation("Confirmado DealId {DealId} para DealReference {DealRef} tras {Attempts} intentos.", dealId, dealReference, i + 1);
+                        return dealId;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error al consultar confirmación para {DealRef} (Intento {Intento}/5)", dealReference, i + 1);
+            }
+            await Task.Delay(200); // Esperar 200ms antes del próximo reintento
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Sincroniza en tiempo real los estados de la base de datos de trades "OPEN" con las posiciones abiertas de Capital.com.
+    /// También importa posiciones abiertas manualmente en Capital.com / TradingView.
+    /// </summary>
+    public async Task SyncOpenTradesAsync()
+    {
+        try
+        {
+            // 1. Obtener todos los trades con estado "OPEN" en PostgreSQL
+            var openDbTrades = await _context.Trades
+                .Where(t => t.Status == "OPEN" && !t.IsDeleted)
+                .ToListAsync();
+
+            // 2. Obtener las posiciones abiertas reales de Capital.com
+            var (cst, securityToken) = await GetSessionTokensAsync();
+            var request = new HttpRequestMessage(HttpMethod.Get, $"{_baseUrl}/positions");
+            request.Headers.Add("X-CAP-API-KEY", _apiKey);
+            request.Headers.Add("CST", cst);
+            request.Headers.Add("X-SECURITY-TOKEN", securityToken);
+
+            var response = await _httpClient.SendAsync(request);
+            var rawJson = await response.Content.ReadAsStringAsync();
+            _logger.LogInformation("Positions API Response: {Body}", rawJson);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("Omitiendo sincronización de estados: No se pudo consultar posiciones de Capital.com.");
+                return;
+            }
+
+            var options = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            var positionsResponse = System.Text.Json.JsonSerializer.Deserialize<CapitalPositionsResponse>(rawJson, options);
+            var activeCapitalPositions = positionsResponse?.Positions ?? new List<CapitalPositionItem>();
+
+            // Crear un set de identificadores activos en Capital.com (tanto dealId como dealReference)
+            var activeIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var item in activeCapitalPositions)
+            {
+                if (item.Position != null)
+                {
+                    if (!string.IsNullOrEmpty(item.Position.DealId)) activeIds.Add(item.Position.DealId);
+                    if (!string.IsNullOrEmpty(item.Position.DealReference)) activeIds.Add(item.Position.DealReference);
+                }
+            }
+
+            // Crear un set de referencias abiertas en nuestra DB
+            var dbOpenRefs = new HashSet<string>(
+                openDbTrades
+                    .Where(t => !string.IsNullOrEmpty(t.DealReference))
+                    .Select(t => t.DealReference!), 
+                StringComparer.OrdinalIgnoreCase
+            );
+
+            bool databaseUpdated = false;
+
+            // 3. Detectar cuáles trades ya no están abiertos en Capital.com o actualizar sus parámetros si cambiaron
+            foreach (var trade in openDbTrades)
+            {
+                // Buscar si la posición correspondiente sigue abierta en Capital.com
+                var capitalPosition = activeCapitalPositions
+                    .FirstOrDefault(p => p.Position != null && 
+                                         (string.Equals(p.Position.DealId, trade.DealReference, StringComparison.OrdinalIgnoreCase) || 
+                                          string.Equals(p.Position.DealReference, trade.DealReference, StringComparison.OrdinalIgnoreCase)));
+
+                if (capitalPosition?.Position == null)
+                {
+                    // Si el trade no tiene DealReference o si su DealReference no está en la lista de Capital.com, se considera cerrado
+                    _logger.LogInformation("Sincronización: El trade {TradeId} (Ticker: {Ticker}, Ref: {Ref}) ya no existe en Capital.com. Marcándolo como CLOSED.",
+                        trade.Id, trade.Ticker, trade.DealReference);
+                    trade.Status = "CLOSED";
+                    trade.ProfitLoss = 0; // Opcional
+                    databaseUpdated = true;
+                    
+                    // Notificar vía SignalR del cambio de estado
+                    await _hubContext.Clients.All.SendAsync("TradeUpdated", trade);
+                }
+                else
+                {
+                    // La posición sigue abierta. Comprobar si se ha modificado SL, TP, volumen (Size), dirección o precio de entrada
+                    var pos = capitalPosition.Position;
+                    bool tradeChanged = false;
+
+                    var newSL = pos.StopLevel ?? 0;
+                    if (trade.StopLoss != newSL)
+                    {
+                        _logger.LogInformation("Sincronización: Modificación SL detectada para {Ticker} (Ref: {Ref}). Viejo: {Old}, Nuevo: {New}", trade.Ticker, trade.DealReference, trade.StopLoss, newSL);
+                        trade.StopLoss = newSL;
+                        tradeChanged = true;
+                    }
+
+                    var newTP = pos.ProfitLevel ?? 0;
+                    if (trade.TakeProfit != newTP)
+                    {
+                        _logger.LogInformation("Sincronización: Modificación TP detectada para {Ticker} (Ref: {Ref}). Viejo: {Old}, Nuevo: {New}", trade.Ticker, trade.DealReference, trade.TakeProfit, newTP);
+                        trade.TakeProfit = newTP;
+                        tradeChanged = true;
+                    }
+
+                    var newSize = pos.Size ?? 0;
+                    if (trade.Size != newSize)
+                    {
+                        _logger.LogInformation("Sincronización: Modificación Volumen (Size) detectada para {Ticker} (Ref: {Ref}). Viejo: {Old}, Nuevo: {New}", trade.Ticker, trade.DealReference, trade.Size, newSize);
+                        trade.Size = newSize;
+                        tradeChanged = true;
+                    }
+
+                    var newDirection = pos.Direction ?? "BUY";
+                    if (!string.Equals(trade.Direction, newDirection, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.LogInformation("Sincronización: Modificación Dirección detectada para {Ticker} (Ref: {Ref}). Viejo: {Old}, Nuevo: {New}", trade.Ticker, trade.DealReference, trade.Direction, newDirection);
+                        trade.Direction = newDirection.ToUpperInvariant();
+                        tradeChanged = true;
+                    }
+
+                    var newEntryPrice = pos.Level ?? 0;
+                    if (trade.EntryPrice != newEntryPrice)
+                    {
+                        _logger.LogInformation("Sincronización: Modificación Precio de Entrada detectada para {Ticker} (Ref: {Ref}). Viejo: {Old}, Nuevo: {New}", trade.Ticker, trade.DealReference, trade.EntryPrice, newEntryPrice);
+                        trade.EntryPrice = newEntryPrice;
+                        tradeChanged = true;
+                    }
+
+                    var newUpl = pos.Upl;
+                    if (trade.ProfitLoss != newUpl)
+                    {
+                        trade.ProfitLoss = newUpl;
+                        tradeChanged = true;
+                    }
+
+                    if (tradeChanged)
+                    {
+                        databaseUpdated = true;
+                        // Notificar vía SignalR del cambio en vivo
+                        await _hubContext.Clients.All.SendAsync("TradeUpdated", trade);
+                    }
+                }
+            }
+
+            // 4. Importar posiciones abiertas en Capital.com que no estén registradas en nuestra base de datos
+            foreach (var item in activeCapitalPositions)
+            {
+                if (item.Position == null || string.IsNullOrEmpty(item.Position.DealId)) continue;
+
+                var dealId = item.Position.DealId;
+                var dealRef = item.Position.DealReference;
+
+                // Si no está registrado en la lista de trades abiertos locales
+                bool alreadyTracked = dbOpenRefs.Contains(dealId) || (!string.IsNullOrEmpty(dealRef) && dbOpenRefs.Contains(dealRef));
+
+                if (!alreadyTracked)
+                {
+                    // Comprobación de seguridad en la DB completa (por si está con otro estado o IsDeleted)
+                    var existsInDb = await _context.Trades.AnyAsync(t => t.DealReference == dealId || (!string.IsNullOrEmpty(dealRef) && t.DealReference == dealRef));
+                    if (existsInDb) continue;
+
+                    _logger.LogInformation("Sincronización: Importando posición externa/manual activa de Capital.com: {Epic} | DealId: {DealId}",
+                        item.Market?.Symbol ?? item.Market?.Epic ?? "UNKNOWN", dealId);
+
+                    DateTime createdAt = DateTime.UtcNow;
+                    if (!string.IsNullOrEmpty(item.Position.CreatedDate) && DateTime.TryParse(item.Position.CreatedDate, out var parsedDate))
+                    {
+                        createdAt = parsedDate.ToUniversalTime();
+                    }
+
+                    var newTrade = new Trade
+                    {
+                        Id = Guid.NewGuid(),
+                        Ticker = item.Market?.Symbol ?? item.Market?.Epic ?? "UNKNOWN",
+                        Strategy = "Manual / External",
+                        Direction = item.Position.Direction ?? "BUY",
+                        EntryPrice = item.Position.Level ?? 0,
+                        StopLoss = item.Position.StopLevel ?? 0,
+                        TakeProfit = item.Position.ProfitLevel ?? 0,
+                        Size = item.Position.Size ?? 0,
+                        Status = "OPEN",
+                        ProfitLoss = item.Position.Upl,
+                        CreatedAt = createdAt,
+                        DealReference = dealId, // Guardamos el dealId directamente como referencia
+                        IsDeleted = false
+                    };
+
+                    await _context.Trades.AddAsync(newTrade);
+                    databaseUpdated = true;
+
+                    // Emitir en tiempo real vía SignalR
+                    await _hubContext.Clients.All.SendAsync("TradeUpdated", newTrade);
+                }
+            }
+
+            if (databaseUpdated)
+            {
+                await _context.SaveChangesAsync();
+                _logger.LogInformation("Base de datos sincronizada con los estados de Capital.com.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error al sincronizar los estados de los trades activos con Capital.com");
+        }
     }
 }
