@@ -88,19 +88,34 @@ f_calc_sl_tp(entry_price, sl_raw, is_long, rrr_val) =>
     final_tp = is_long ? entry_price + final_sl_dist_pips * rrr_val * pip_size : entry_price - final_sl_dist_pips * rrr_val * pip_size
     [final_sl, final_tp]
 
-// Cálculo dinámico de Lote (Universal, soporta cualquier cruce o metal usando syminfo.pipvalue y syminfo.contractsize)
+// Definimos la función para que el retorno de la tupla [final_qty, final_lot] sea válido
 f_calculate_position_size(entry_price, sl_price) =>
+    // Distancia al Stop Loss en precio y en pips
     sl_dist = math.abs(entry_price - sl_price)
     sl_dist_pips = sl_dist / pip_size
+    
     if sl_dist_pips <= 0
         [0.0, 0.0]
     else
+        // 1. Riesgo monetario
         loss_amount = strategy.equity * (risk_pct / 100.0)
-        qty_units = loss_amount / (sl_dist_pips * syminfo.pipvalue)
         
-        contract_size = syminfo.contractsize
+        // 2. Corrección de syminfo.pipvalue: Valor monetario de 1 pip para 1 sola unidad
+        unit_pip_value = pip_size * syminfo.pointvalue
+        
+        // 3. Unidades totales necesarias para alcanzar el riesgo exacto
+        qty_units = loss_amount / (sl_dist_pips * unit_pip_value)
+        
+        // 4. Corrección de syminfo.contractsize: Lote Estándar en Forex = 100,000 unidades
+        contract_size = 100000.0
+        
+        // 5. Redondeo del lote al segundo decimal (ej. 0.15) limitando a un mínimo de 0.01 micro lotes
         final_lot = math.max(0.01, math.round(qty_units / contract_size, 2))
+        
+        // 6. Conversión del lote real de nuevo a unidades exactas para que TradingView lo entienda
         final_qty = final_lot * contract_size
+        
+        // 7. Retorno válido de la tupla
         [final_qty, final_lot]
 
 
