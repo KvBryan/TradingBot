@@ -72,6 +72,7 @@ public class TradingBotDbContext : DbContext
             entity.Property(t => t.TakeProfit).HasPrecision(18, 6);
             entity.Property(t => t.Size).HasPrecision(18, 4);
             entity.Property(t => t.ProfitLoss).HasPrecision(18, 6);
+            entity.Property(t => t.DealReference).HasMaxLength(100);
             entity.Property(t => t.IsDeleted).HasDefaultValue(false);
         });
 

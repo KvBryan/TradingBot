@@ -177,32 +177,36 @@ public class CapitalComService
     /// </summary>
     public async Task<WebhookResponse> ExecuteWebhookOrderAsync(WebhookRequest alert)
     {
-        _logger.LogInformation("=== INICIO PROCESAMIENTO WEBHOOK ESTRATEGIA: {Strategy} ===", alert.Strategy);
+        var symbol = alert.Symbol ?? throw new ArgumentException("El símbolo no puede ser nulo.");
+        var action = alert.Action ?? throw new ArgumentException("La acción no puede ser nula.");
+        var strategy = alert.Strategy ?? "Unknown";
 
-        var isCloseAction = string.Equals(alert.Action, "CLOSE", StringComparison.OrdinalIgnoreCase) ||
-                            string.Equals(alert.Action, "CANCEL", StringComparison.OrdinalIgnoreCase);
+        _logger.LogInformation("=== INICIO PROCESAMIENTO WEBHOOK ESTRATEGIA: {Strategy} ===", strategy);
+
+        var isCloseAction = string.Equals(action, "CLOSE", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(action, "CANCEL", StringComparison.OrdinalIgnoreCase);
 
         if (isCloseAction)
         {
-            _logger.LogInformation("Alerta de CIERRE/CANCELACIÓN recibida para {Symbol} - Estrategia: {Strategy}", alert.Symbol, alert.Strategy);
+            _logger.LogInformation("Alerta de CIERRE/CANCELACIÓN recibida para {Symbol} - Estrategia: {Strategy}", symbol, strategy);
 
             // 1. Buscar la posición activa en nuestra DB
-            var activeTrade = await _context.Trades
-                .Where(t => t.Ticker == alert.Symbol && t.Strategy == alert.Strategy && t.Status == "OPEN" && !t.IsDeleted)
+            var tradeToClose = await _context.Trades
+                .Where(t => t.Ticker == symbol && t.Strategy == strategy && t.Status == "OPEN" && !t.IsDeleted)
                 .OrderByDescending(t => t.CreatedAt)
                 .FirstOrDefaultAsync();
 
-            if (activeTrade == null)
+            if (tradeToClose == null)
             {
-                _logger.LogWarning("No se encontró ningún trade activo en PostgreSQL para {Symbol} y estrategia {Strategy} para cerrar.", alert.Symbol, alert.Strategy);
+                _logger.LogWarning("No se encontró ningún trade activo en PostgreSQL para {Symbol} y estrategia {Strategy} para cerrar.", symbol, strategy);
                 return new WebhookResponse(false, "No se encontró ningún trade activo para cerrar.");
             }
 
             // 2. Cerrar en Capital.com si tenemos DealReference
             bool capitalClosed = false;
-            if (!string.IsNullOrEmpty(activeTrade.DealReference))
+            if (!string.IsNullOrEmpty(tradeToClose.DealReference))
             {
-                capitalClosed = await ClosePositionOnCapitalComAsync(activeTrade.DealReference);
+                capitalClosed = await ClosePositionOnCapitalComAsync(tradeToClose.DealReference);
             }
             else
             {
@@ -210,14 +214,14 @@ public class CapitalComService
             }
 
             // 3. Actualizar base de datos
-            activeTrade.Status = "CLOSED";
-            activeTrade.ProfitLoss = 0; // Opcional
+            tradeToClose.Status = "CLOSED";
+            tradeToClose.ProfitLoss = 0; // Opcional
             await _context.SaveChangesAsync();
 
             // 4. Notificar vía SignalR
             try
             {
-                await _hubContext.Clients.All.SendAsync("TradeUpdated", activeTrade);
+                await _hubContext.Clients.All.SendAsync("TradeUpdated", tradeToClose);
                 _logger.LogInformation("Trade de cierre transmitido vía SignalR.");
             }
             catch (Exception ex)
@@ -228,21 +232,21 @@ public class CapitalComService
             return new WebhookResponse(
                 Success: true,
                 Message: capitalClosed 
-                    ? $"Posición cerrada exitosamente en Capital.com y base de datos para {alert.Symbol}." 
-                    : $"Posición cerrada en base de datos para {alert.Symbol} (no se pudo cerrar en Capital.com)."
+                    ? $"Posición cerrada exitosamente en Capital.com y base de datos para {symbol}." 
+                    : $"Posición cerrada en base de datos para {symbol} (no se pudo cerrar en Capital.com)."
             );
         }
         
         // Validar si ya hay un trade activo en PostgreSQL para evitar duplicar el riesgo
         var activeTrade = await _context.Trades
-            .Where(t => t.Ticker == alert.Symbol && t.Strategy == alert.Strategy && t.Status == "OPEN" && !t.IsDeleted)
+            .Where(t => t.Ticker == symbol && t.Strategy == strategy && t.Status == "OPEN" && !t.IsDeleted)
             .OrderByDescending(t => t.CreatedAt)
             .FirstOrDefaultAsync();
 
         if (activeTrade != null)
         {
-            _logger.LogWarning("Se recibió una señal de APERTURA para {Symbol} con estrategia {Strategy}, pero ya existe una posición activa abierta en PostgreSQL.", alert.Symbol, alert.Strategy);
-            return new WebhookResponse(false, $"Ya existe una posición abierta para {alert.Symbol} con esta estrategia. Orden ignorada para evitar sobreexposición.");
+            _logger.LogWarning("Se recibió una señal de APERTURA para {Symbol} con estrategia {Strategy}, pero ya existe una posición activa abierta en PostgreSQL.", symbol, strategy);
+            return new WebhookResponse(false, $"Ya existe una posición abierta para {symbol} con esta estrategia. Orden ignorada para evitar sobreexposición.");
         }
         
         // 1. Obtener tokens de sesión válidos (reutilización)
@@ -261,7 +265,7 @@ public class CapitalComService
         }
 
         // Definir tamaño de pip según convención Forex (4 decimales para estándar, 2 para JPY)
-        var isJpyPair = alert.Symbol.Contains("JPY", StringComparison.OrdinalIgnoreCase);
+        var isJpyPair = symbol.Contains("JPY", StringComparison.OrdinalIgnoreCase);
         var pipSize = isJpyPair ? 0.01m : 0.0001m;
         var slDistanceInPips = slDistance / pipSize;
 
@@ -273,11 +277,11 @@ public class CapitalComService
         // Size = Riesgo Máximo / slDistance
         
         decimal calculatedSize;
-        if (alert.Symbol.EndsWith("USD", StringComparison.OrdinalIgnoreCase))
+        if (symbol.EndsWith("USD", StringComparison.OrdinalIgnoreCase))
         {
             calculatedSize = maxRisk / slDistance;
         }
-        else if (alert.Symbol.StartsWith("USD", StringComparison.OrdinalIgnoreCase))
+        else if (symbol.StartsWith("USD", StringComparison.OrdinalIgnoreCase))
         {
             calculatedSize = maxRisk * alert.EntryPrice.GetValueOrDefault() / slDistance;
         }
@@ -299,10 +303,10 @@ public class CapitalComService
             maxRisk.ToString("F2"), slDistanceInPips.ToString("F1"), calculatedSize);
 
         // 4. Enviar Orden Bracket OCO
-        var epic = ResolveEpic(alert.Symbol);
+        var epic = ResolveEpic(symbol);
         var positionReq = new PositionRequest(
             Epic: epic,
-            Direction: alert.Action.Equals("BUY", StringComparison.OrdinalIgnoreCase) ? "BUY" : "SELL",
+            Direction: action.Equals("BUY", StringComparison.OrdinalIgnoreCase) ? "BUY" : "SELL",
             Size: calculatedSize,
             StopLevel: alert.StopLoss,
             ProfitLevel: alert.TakeProfit
@@ -339,9 +343,9 @@ public class CapitalComService
         var trade = new Trade
         {
             Id = Guid.NewGuid(),
-            Ticker = alert.Symbol,
-            Strategy = alert.Strategy,
-            Direction = alert.Action.Equals("BUY", StringComparison.OrdinalIgnoreCase) ? "BUY" : "SELL",
+            Ticker = symbol,
+            Strategy = strategy,
+            Direction = action.Equals("BUY", StringComparison.OrdinalIgnoreCase) ? "BUY" : "SELL",
             EntryPrice = alert.EntryPrice.GetValueOrDefault(),
             StopLoss = alert.StopLoss.GetValueOrDefault(),
             TakeProfit = alert.TakeProfit.GetValueOrDefault(),
@@ -540,17 +544,6 @@ public class CapitalComService
             var options = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
             var positionsResponse = System.Text.Json.JsonSerializer.Deserialize<CapitalPositionsResponse>(rawJson, options);
             var activeCapitalPositions = positionsResponse?.Positions ?? new List<CapitalPositionItem>();
-
-            // Crear un set de identificadores activos en Capital.com (tanto dealId como dealReference)
-            var activeIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var item in activeCapitalPositions)
-            {
-                if (item.Position != null)
-                {
-                    if (!string.IsNullOrEmpty(item.Position.DealId)) activeIds.Add(item.Position.DealId);
-                    if (!string.IsNullOrEmpty(item.Position.DealReference)) activeIds.Add(item.Position.DealReference);
-                }
-            }
 
             // Crear un set de referencias abiertas en nuestra DB
             var dbOpenRefs = new HashSet<string>(

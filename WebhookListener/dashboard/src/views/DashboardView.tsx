@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { Trade, SystemLog } from '../types';
 import { HubConnectionBuilder, HubConnection } from '@microsoft/signalr';
+import { getApiUrl } from '../utils/api';
 
 
 export const DashboardView: React.FC = () => {
@@ -42,7 +43,7 @@ export const DashboardView: React.FC = () => {
     setIsLoadingTrades(true);
     setErrorTrades(null);
     try {
-      const response = await fetch('http://localhost:8080/api/v1/trades', {
+      const response = await fetch(getApiUrl('/api/v1/trades'), {
         headers: {
           'Authorization': `Bearer ${token}`,
         }
@@ -65,7 +66,7 @@ export const DashboardView: React.FC = () => {
     setIsLoadingLogs(true);
     setErrorLogs(null);
     try {
-      const response = await fetch('http://localhost:8080/api/v1/logs', {
+      const response = await fetch(getApiUrl('/api/v1/logs'), {
         headers: {
           'Authorization': `Bearer ${token}`,
         }
@@ -87,7 +88,7 @@ export const DashboardView: React.FC = () => {
   // HTTP Fetch function for Capital.com Balance
   const fetchBalance = async () => {
     try {
-      const response = await fetch('http://localhost:8080/api/v1/balance', {
+      const response = await fetch(getApiUrl('/api/v1/balance'), {
         headers: {
           'Authorization': `Bearer ${token}`,
         }
@@ -105,7 +106,7 @@ export const DashboardView: React.FC = () => {
   // Soft-delete action on the backend
   const handleDeleteTrade = async (id: string) => {
     try {
-      const response = await fetch(`http://localhost:8080/api/v1/trades/${id}`, {
+      const response = await fetch(getApiUrl(`/api/v1/trades/${id}`), {
         method: 'DELETE',
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -219,7 +220,7 @@ export const DashboardView: React.FC = () => {
     };
 
     const connection = new HubConnectionBuilder()
-      .withUrl('http://localhost:8080/hubs/trades', {
+      .withUrl(getApiUrl('/hubs/trades'), {
         accessTokenFactory: () => token || ''
       })
       .configureLogging(customLogger)

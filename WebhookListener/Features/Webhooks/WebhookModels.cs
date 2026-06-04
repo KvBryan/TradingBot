@@ -7,12 +7,12 @@ namespace WebhookListener.Features.Webhooks;
 
 // --- DTO de Entrada para Alertas de TradingView ---
 public record WebhookRequest(
-    [property: JsonPropertyName("action")] string Action,
-    [property: JsonPropertyName("symbol")] string Symbol,
+    [property: JsonPropertyName("action")] string? Action = null,
+    [property: JsonPropertyName("symbol")] string? Symbol = null,
     [property: JsonPropertyName("entry_price")] decimal? EntryPrice = null,
     [property: JsonPropertyName("stop_loss")] decimal? StopLoss = null,
     [property: JsonPropertyName("take_profit")] decimal? TakeProfit = null,
-    [property: JsonPropertyName("strategy")] string Strategy,
+    [property: JsonPropertyName("strategy")] string? Strategy = null,
     [property: JsonPropertyName("lot_size")] decimal? LotSize = null,
     [property: JsonPropertyName("magic_number")] int? MagicNumber = null,
     [property: JsonPropertyName("trade_id")] string? TradeId = null
@@ -94,7 +94,7 @@ public record CapitalMarketDetails(
 // --- DTOs para Confirmación de Órdenes de Capital.com ---
 public record CapitalConfirmResponse(
     [property: JsonPropertyName("status")] string Status,
-    [property: JsonPropertyName("affectedDeals")] List<CapitalAffectedDeal> AffectedDeals
+    [property: JsonPropertyName("affectedDeals")] List<CapitalAffectedDeal>? AffectedDeals = null
 );
 
 public record CapitalAffectedDeal(

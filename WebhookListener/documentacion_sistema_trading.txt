@@ -237,6 +237,169 @@ Para pasar el sistema de operaciones simuladas (Demo) a operaciones con capital 
    ```
 4. **Verificación:** Accede al dashboard de control en tu nube. Verifica que la telemetría del balance y margen muestre las métricas correctas de tu cuenta real y que el hosted service (`CapitalComSyncWorker`) se sincronice de forma limpia. El sistema estará listo para operar dinero real inmediatamente sin pasos adicionales.
 
+--------------------------------------------------------------------------------
+9. CONTRATO DE INTEGRACIÓN PINE <-> BACKEND
+--------------------------------------------------------------------------------
+Este contrato define formalmente la interfaz de comunicación entre las alertas generadas por TradingView (Pine Script v6) y el backend receptor (C# / .NET).
+
+A. Protocolo y Endpoint:
+   - Método: HTTP POST.
+   - Endpoint: `https://[dominio]/api/v1/webhook` (ej. `https://bot.kvstudio.me/api/v1/webhook`).
+   - Content-Type: `application/json` o texto plano legible como JSON.
+
+B. Ejemplo de Payload JSON (Apertura):
+   ```json
+   {
+     "action": "BUY",
+     "symbol": "EURUSD",
+     "lot_size": 1.45,
+     "entry_price": 1.08250,
+     "stop_loss": 1.08050,
+     "take_profit": 1.08650,
+     "strategy": "Darvas Box",
+     "magic_number": 1001001,
+     "trade_id": "EURUSD_1001001_1717464000000",
+     "timestamp": 1717464000000
+   }
+   ```
+
+C. Ejemplo de Payload JSON (Cierre):
+   ```json
+   {
+     "action": "CLOSE",
+     "symbol": "EURUSD",
+     "lot_size": 1.45,
+     "entry_price": 1.08250,
+     "stop_loss": 1.08050,
+     "take_profit": null,
+     "strategy": "Darvas Box",
+     "magic_number": 1001001,
+     "trade_id": "EURUSD_1001001_1717464000000",
+     "timestamp": 1717464000000
+   }
+   ```
+
+D. Campos Obligatorios y Validaciones:
+   - "action" (string): Obligatorio. Valores admitidos: "BUY", "SELL", "CLOSE", "CANCEL".
+   - "symbol" (string): Obligatorio. Identifica el instrumento (ej. "EURUSD", "GBPUSD", "USDJPY").
+   - "entry_price", "stop_loss", "take_profit" (decimal/null):
+     - Para aperturas (BUY / SELL): Son estrictamente obligatorios y deben ser mayores a cero.
+     - Para cierres (CLOSE / CANCEL): Se pueden omitir o enviar como null.
+   - "strategy" (string): Obligatorio. Identifica la estrategia de procedencia (ej. "Darvas Box").
+   - "trade_id" (string): Obligatorio. Hash único en formato: `Ticker_MagicNumber_TimestampUnix`.
+
+E. Mecanismo de Autenticación y Seguridad del Webhook:
+   - El webhook no utiliza JWT directamente en la cabecera (el JWT se reserva para el dashboard web y SignalR).
+   - Seguridad Perimetral: Se configura a nivel de proxy inverso (Caddy / Nginx) limitando las peticiones entrantes al endpoint `/api/v1/webhook` únicamente a los rangos de direcciones IP públicas oficiales de TradingView.
+   - Protección contra Replays y Duplicados: El backend implementa una validación estricta de idempotencia en memoria mediante `ProcessedTradeIds`. Si el `trade_id` ya fue procesado, se rechaza de inmediato (retornando éxito al emisor para evitar reintentos fallidos de red).
+
+F. Códigos de Respuesta Esperados:
+   - `200 OK` con `{ "success": true, "message": "..." }`: Procesamiento y ejecución exitosa de la orden.
+   - `200 OK` con `{ "success": false, "message": "..." }`: El webhook fue estructurado de forma válida pero la orden fue rechazada preventivamente (ej. por trade duplicado detectado en PostgreSQL o por idempotencia de `trade_id`).
+   - `400 Bad Request` con `{ "success": false, "message": "..." }`: JSON mal formado o ausencia de parámetros obligatorios en la validación inicial (por ejemplo, omitir stop loss en una apertura).
+
+--------------------------------------------------------------------------------
+10. DIAGRAMA DE ESTADOS DE LA SEÑAL
+--------------------------------------------------------------------------------
+El ciclo de vida de una señal operativa se describe mediante la siguiente jerarquía de estados:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle : Monitorizando Mercado (Barra a Barra)
+    
+    Idle --> Breakout_Detected : Ruptura de Darvas Box (Top/Bottom)
+    note right of Breakout_Detected
+        Se activa waiting_retest = true
+        Se define retest_level = nivel roto
+        retest_bars_counter = 0
+    end note
+
+    Breakout_Detected --> Idle : Expiración (retest_bars_counter > 15 velas) o ruptura opuesta
+    
+    Breakout_Detected --> Limit_Order_Placed : allowed_to_enter == true
+    note right of Limit_Order_Placed
+        Se coloca orden límite virtual en TradingView.
+    end note
+    
+    Limit_Order_Placed --> Idle : Cancelación de orden (retest_bars_counter > 15 velas)
+    
+    Limit_Order_Placed --> Position_Entered : Precio retestea y toca el nivel
+    note right of Position_Entered
+        Se ejecuta orden límite en TradingView.
+        Se envía Webhook POST al backend.
+        Backend abre orden real a mercado en Capital.com.
+        Estado del trade en PostgreSQL pasa a "OPEN".
+    end note
+    
+    Position_Entered --> Break_Even_Active : Precio alcanza RRR 1:1 (be_trigger_price)
+    note right of Break_Even_Active
+        El SL se ajusta al precio de entrada más buffer de spread.
+    end note
+    
+    Position_Entered --> Trailing_Active : Precio alcanza 1.5 RRR
+    Break_Even_Active --> Trailing_Active : Precio alcanza 1.5 RRR
+    note right of Trailing_Active
+        Take Profit estático se anula (tp = null).
+        Trailing Stop ATR dinámico se activa (1.5 * ATR14 bar-by-bar).
+    end note
+    
+    Position_Entered --> Position_Closed : Precio toca Stop Loss o Take Profit estático
+    Break_Even_Active --> Position_Closed : Precio toca Stop Loss en BE
+    Trailing_Active --> Position_Closed : Precio toca Trailing Stop
+    
+    Position_Closed --> Idle : Webhook de salida recibido en Backend. DB se actualiza a "CLOSED".
+```
+
+--------------------------------------------------------------------------------
+11. CONVENCIÓN TEMPORAL Y ZONAS HORARIAS
+--------------------------------------------------------------------------------
+Para garantizar la consistencia en el cálculo de drawdown diario, el control horario y las marcas de tiempo entre el gráfico de TradingView, el microservicio y el broker, se establecen las siguientes reglas:
+
+- **Reset del Drawdown Diario**: Se ejecuta mediante `ta.change(time("D")) != 0` utilizando la zona horaria del instrumento (Forex operando 24 horas usa UTC). El drawdown diario y el contador de trades se reinician a cero a las 00:00 UTC.
+- **Sesión Operativa Nueva York (NY)**: La ventana operativa segura de volatilidad se define mediante el parámetro `ny_session = "0600-1200:23456"`, evaluado en base al huso horario de Nueva York (EST/EDT) para concentrar las entradas en las horas de mayor liquidez.
+- **Filtro de Noticias Macro**: Los límites de bloqueo de noticias (`news1_start`, etc.) se declaran utilizando el timezone local de New York especificando el desfase GMT en Pine Script (ej. `-0400` para horario de verano de Nueva York - EDT).
+- **Marcas de Tiempo (Timestamps)**: El webhook envía la variable nativa `time` de Pine (milisegundos Unix en formato UTC). El backend almacena todas las marcas de tiempo de creación e histórico en PostgreSQL utilizando UTC (`DateTime.UtcNow`).
+
+--------------------------------------------------------------------------------
+12. DETALLE DE PARÁMETROS MATEMÁTICOS DEL HMM (JUSTIFICACIÓN DE CONSTANTES)
+--------------------------------------------------------------------------------
+Para cumplir con los principios cuantitativos de diseño robusto y blindar el bot contra el sobreajuste (curve-fitting), el modelado del Hidden Markov Model (HMM) fija por completo en el código el 70% de las variables. La justificación de estos valores constantes es:
+
+- `hmm_long_period = 200`: Calibra la desviación estándar estructural de largo plazo (`long_term_sigma`). Una ventana de 200 barras representa la volatilidad promedio histórica e impide que picos de volatilidad aislados e inestables sesguen el cálculo dinámico de estados del HMM.
+- `mu0 = 0.0` y `mu1 = 0.0`: En retornos logarítmicos financieros de corto a mediano plazo, el retorno promedio esperado tiende matemáticamente a cero. Estimar y calibrar medias dinámicas sobre muestras pequeñas añade ruido e inestabilidad al sistema.
+- `sigma0_mult = 0.5`: Multiplicador para el Estado 0 (Compresión de volatilidad). Fija que el estado de compresión/rango tiene una desviación equivalente a la mitad de la volatilidad histórica a largo plazo, aislando eficazmente periodos laterales.
+- `sigma1_mult = 1.5`: Multiplicador para el Estado 1 (Expansión de tendencia). Define que el estado tendencial requiere de un aumento del 150% en la desviación de los retornos logarítmicos con respecto al histórico base, protegiendo al bot de rupturas falsas.
+- **Matriz de Transición Fija ($A$)**:
+  - $p_{00} = 0.85$, $p_{01} = 0.15$: Representa que los mercados permanecen en rango o consolidación el 85% del tiempo.
+  - $p_{11} = 0.80$, $p_{10} = 0.20$: Permite la inercia tendencial una vez iniciado el impulso expansivo, pero fuerza una transición rápida a compresión si la volatilidad decrece.
+  - *Justificación general*: Al fijar estos coeficientes de probabilidad, la estimación del régimen HMM se vuelve dependiente únicamente de un parámetro libre (`hmm_period`). Esto cumple con las restricciones paramétricas ideales (máximo 2-4 variables libres en total) necesarias para superar backtests cuantitativos exigentes.
+
+--------------------------------------------------------------------------------
+13. SEMÁNTICA DEL MAGIC NUMBER DINÁMICO
+--------------------------------------------------------------------------------
+El número mágico se compone en Pine Script de forma dinámica mediante la fórmula:
+`dynamic_magic = active_magic * 1000 + daily_trade_count`
+
+Donde:
+- `active_magic` (int): Identifica el sentido y origen de la orden.
+  - `1001`: Aperturas de Compra (Long).
+  - `1002`: Aperturas de Venta (Short).
+- `daily_trade_count` (int): Secuencia interna de operaciones abiertas en el día calendario actual (comienza en 0 tras el reset diario y se incrementa en 1 por cada orden ejecutada).
+
+**Uso aguas abajo (Downstream en Backend)**:
+- **Idempotencia avanzada**: El backend guarda el número mágico en PostgreSQL. En caso de recibir un webhook de cierre (`CLOSE`) para un par que tiene múltiples ejecuciones simultáneas debido a otras estrategias o cuentas paralelas, la combinación del magic_number junto con la estrategia permite reconciliar e identificar cuál posición exacta debe cerrarse en Capital.com.
+- **Auditoría e Historial**: El número mágico permite la reconstrucción cronológica y análisis estadístico diario en la base de datos sin depender únicamente de marcas de tiempo del servidor.
+
+--------------------------------------------------------------------------------
+14. ACLARACIONES E INCONSISTENCIAS DE DOCUMENTACIÓN RESUELTAS
+--------------------------------------------------------------------------------
+1. **Cálculo de Lotaje Dinámico vs ATR**:
+   - *Corrección*: Se aclara que la posición de volumen (lotes) se calcula exclusivamente usando el capital arriesgado del 1%, la distancia al Stop Loss estructural en pips y el valor por contrato (`syminfo.pipvalue` / `syminfo.contractsize`). El ATR no influye en el cálculo del lotaje; el ATR se utiliza únicamente para el Stop de arrastre (Trailing Stop) dinámico.
+2. **Filtro de Noticias Macro**:
+   - *Aclaración*: El filtro es semi-manual. Depende de las variables `newsX_start` y `newsX_end` configuradas en Pine Script. Si no se actualizan las fechas para eventos futuros o si `news_expired` marca `true` (al pasar `news3_end`), el filtro debe desactivarse manualmente o actualizarse en TradingView para evitar el bloqueo preventivo indefinido.
+3. **Interacción entre Filtros y Retest**:
+   - *Aclaración*: El bot detecta las rupturas Darvas y activa el estado de retest en Pine Script *antes* de comprobar los filtros de entrada (`allowed_to_enter`). Si el precio retestea el nivel de retest en un momento en que los filtros temporales (ej: noticias o fuera de hora) ya no bloquean la entrada, el bot colocará la orden. Si los filtros siguen activos al retestear, la señal expira silenciosamente sin colocar orden límite virtual.
+
 ================================================================================
 FIN DEL DOCUMENTO
 ================================================================================

@@ -1,5 +1,5 @@
 //@version=6
-strategy("Estrategia Cuantitativa Forex Unificada 2026", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, slippage=1)
+strategy("Estrategia Cuantitativa Forex Unificada 2026", overlay=true, initial_capital=10000, slippage=3)
 
 // ==========================================
 // 1. PARÁMETROS DE ENTRADA (INPUTS)
@@ -9,13 +9,25 @@ strategy("Estrategia Cuantitativa Forex Unificada 2026", overlay=true, initial_c
 enable_darvas   = input.bool(true, "Habilitar Módulo 1: Darvas Box Break & Retest", group="Configuración de Módulos")
 enable_pullback = input.bool(true, "Habilitar Módulo 2: Trend Pullback", group="Configuración de Módulos")
 enable_sr       = input.bool(true, "Habilitar Módulo 3: S&R Bounce", group="Configuración de Módulos")
+engulfing_min_atr_factor = input.float(0.3, "Factor de Cuerpo Mínimo para Engulfing (X * ATR)", group="Configuración de Módulos")
 
-// --- Filtros de Control ---
-estimated_spread = input.float(1.5, "Spread Estimado Actual (Pips)", step=0.1, group="Filtros de Control")
-max_spread       = input.float(2.0, "Spread Máximo Permitido (Pips)", step=0.1, group="Filtros de Control")
-ny_session       = input.session("0600-1200:23456", "Sesión de Alta Liquidez (Nueva York)", group="Filtros de Control")
+// --- Gestión de Capital y Riesgo ---
+risk_pct        = input.float(1.0, "Porcentaje de Riesgo por Operación (%)", minval=0.1, maxval=5.0, step=0.1, group="Gestión de Capital")
+max_daily_loss  = input.float(3.0, "Límite de Drawdown Diario (%)", minval=0.1, maxval=10.0, step=0.1, group="Gestión de Capital")
+max_daily_trades = input.int(3, "Máximo de Operaciones Diarias", minval=1, maxval=10, group="Gestión de Capital")
+enable_margin_protection = input.bool(true, "Habilitar Protección de Margin Call", group="Gestión de Capital")
+margin_threshold_pct = input.float(80.0, "Umbral de Pérdida de Margen (%)", minval=10.0, maxval=95.0, step=5.0, group="Gestión de Capital")
+leverage = input.float(30.0, "Apalancamiento de la Cuenta (1:X)", minval=1.0, group="Gestión de Capital")
 
-// --- Módulo 1: Darvas Box & Break-and-Retest ---
+// --- Configuración RRR por Módulo ---
+darvas_rrr      = input.float(4.0, "Darvas Box RRR (1:X)", minval=1.0, group="Gestión de Riesgo")
+pullback_rrr    = input.float(3.0, "Trend Pullback RRR (1:X)", minval=1.0, group="Gestión de Riesgo")
+sr_rrr          = input.float(2.0, "S&R Bounce RRR (1:X)", minval=1.0, group="Gestión de Riesgo")
+
+buffer_pips     = input.float(2.0, "Buffer del Stop Loss (Pips)", step=0.5, group="Gestión de Riesgo")
+min_sl_pips     = input.float(5.0, "Stop Loss Mínimo (Pips)", step=1.0, group="Gestión de Riesgo")
+
+// --- Módulo 1: Darvas Box ---
 darvas_length          = input.int(10, "Periodo de Caja Darvas (Velas)", minval=5, group="Módulo 1: Darvas Box")
 darvas_max_retest_bars = input.int(30, "Límite de Velas para Retesteo", minval=1, group="Módulo 1: Darvas Box")
 darvas_invalid_mult    = input.float(2.0, "Multiplicador de Invalidez (Alto/Bajo Caja)", step=0.1, group="Módulo 1: Darvas Box")
@@ -23,16 +35,34 @@ darvas_invalid_mult    = input.float(2.0, "Multiplicador de Invalidez (Alto/Bajo
 // --- Módulo 2: Trend Pullback ---
 ema20_len          = input.int(20, "Periodo EMA 20 (Rápida)", minval=5, group="Módulo 2: Trend Pullback")
 ema50_len          = input.int(50, "Periodo EMA 50 (Lenta)", minval=10, group="Módulo 2: Trend Pullback")
+pullback_atr_mult  = input.float(2.0, "Multiplicador ATR para SL Pullback", step=0.1, group="Módulo 2: Trend Pullback")
 pullback_tolerance = input.float(2.0, "Tolerancia de Pullback (Pips)", step=0.5, group="Módulo 2: Trend Pullback")
 
 // --- Módulo 3: S&R Bounce ---
-low_liq_session = input.session("1200-1600:23456", "Sesión de Operación (Baja Liquidez)", group="Módulo 3: S&R Bounce")
-pivot_len       = input.int(5, "Periodo de Pivotes (Izquierda/Derecha)", minval=2, group="Módulo 3: S&R Bounce")
+pivot_len           = input.int(5, "Periodo de Pivotes (Izquierda/Derecha)", minval=2, group="Módulo 3: S&R Bounce")
+restrict_sr_session = input.bool(true, "Evitar S&R en Sesión de Baja Liquidez (1200-1600)", group="Módulo 3: S&R Bounce")
+sr_min_distance_pips = input.float(1.5, "Distancia Mínima de Cierre al Pivote (Pips)", step=0.1, group="Módulo 3: S&R Bounce")
+pivot_invalidation_pips = input.float(10.0, "Pips para Invalidar Pivote Histórico", minval=1.0, step=1.0, group="Módulo 3: S&R Bounce")
 
-// --- Gestión de Riesgo ---
-rrr         = input.float(2.0, "Ratio Riesgo / Beneficio (1:X)", minval=1.0, group="Gestión de Riesgo")
-buffer_pips = input.float(2.0, "Buffer del Stop Loss (Pips)", step=0.5, group="Gestión de Riesgo")
-min_sl_pips = input.float(5.0, "Stop Loss Mínimo (Pips)", step=1.0, group="Gestión de Riesgo")
+// --- Filtros de Horarios y Control de Spread ---
+ny_session         = input.session("0600-1200:23456", "Sesión de Alta Liquidez (Nueva York)", group="Filtros de Control")
+estimated_spread   = input.float(1.5, "Spread Estimado Actual (Pips)", step=0.1, group="Filtros de Control")
+max_spread         = input.float(2.0, "Spread Máximo Permitido (Pips)", step=0.1, group="Filtros de Control")
+
+// --- Filtro de Noticias Macro ---
+enable_news_filter = input.bool(true, "Habilitar Filtro de Noticias Macro", group="Filtro de Noticias")
+news_daily_session = input.session("", "Horario Diario Bloqueo de Noticias", group="Filtro de Noticias")
+news1_start = input.time(timestamp("2026-06-05 08:30 -0400"), "Noticia 1: Inicio", group="Filtro de Noticias")
+news1_end   = input.time(timestamp("2026-06-05 09:00 -0400"), "Noticia 1: Fin", group="Filtro de Noticias")
+news2_start = input.time(timestamp("2026-06-10 14:00 -0400"), "Noticia 2: Inicio", group="Filtro de Noticias")
+news2_end   = input.time(timestamp("2026-06-10 14:30 -0400"), "Noticia 2: Fin", group="Filtro de Noticias")
+news3_start = input.time(timestamp("2026-06-18 14:00 -0400"), "Noticia 3: Inicio", group="Filtro de Noticias")
+news3_end   = input.time(timestamp("2026-06-18 14:30 -0400"), "Noticia 3: Fin", group="Filtro de Noticias")
+
+// --- Trailing Stop & Break-Even ---
+enable_trailing         = input.bool(true, "Habilitar Trailing Stop Dinámico", group="Gestión de Riesgo - Trailing")
+trailing_activation_rrr = input.float(2.0, "Activación de Trailing (RRR 1:X)", minval=0.5, group="Gestión de Riesgo - Trailing")
+trailing_distance_atr   = input.float(1.5, "Distancia de Trailing (X * ATR)", minval=0.5, group="Gestión de Riesgo - Trailing")
 
 
 // ==========================================
@@ -52,47 +82,175 @@ f_format_price(val) =>
      syminfo.mintick == 0.01    ? str.tostring(val, "#.##") :
      str.tostring(val)
 
-// Construye el JSON estricto sin barras invertidas innecesarias
-f_build_json(action, entry, sl, tp, strategy_name) =>
-    str.format('{{"action": "{0}", "symbol": "{1}", "entry_price": {2}, "stop_loss": {3}, "take_profit": {4}, "strategy": "{5}"}}', 
-               action, syminfo.ticker, f_format_price(entry), f_format_price(sl), f_format_price(tp), strategy_name)
+// Construye el JSON estricto utilizando únicamente concatenación para evitar bugs de TradingView
+f_build_json(action, ticker, lot, entry, sl, tp, strategy_name, magic, ts) =>
+    p1 = "{\"action\": \"" + action + "\", \"symbol\": \"" + ticker + "\", "
+    p2 = "\"lot_size\": " + str.tostring(lot, "#.##") + ", "
+    p3 = "\"entry_price\": " + f_format_price(entry) + ", "
+    p4 = "\"stop_loss\": " + f_format_price(sl) + ", "
+    p5 = "\"take_profit\": " + f_format_price(tp) + ", "
+    p6 = "\"strategy\": \"" + strategy_name + "\", "
+    p7 = "\"magic_number\": " + str.tostring(magic) + ", "
+    p8 = "\"timestamp\": " + str.tostring(ts) + "}"
+    p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8
 
-// Calcula los niveles dinámicos de SL y TP aplicando el RRR y el SL mínimo
-f_calc_sl_tp(entry_price, sl_raw, is_long) =>
+// Calcula los niveles dinámicos de SL y TP aplicando el RRR, el SL mínimo y la penalización de spread dinámico
+f_calc_sl_tp(entry_price, sl_raw, is_long, rrr_val) =>
     pip_val = f_pip_size()
     sl_dist = is_long ? entry_price - sl_raw : sl_raw - entry_price
-    sl_dist_pips = sl_dist / pip_val
+    sl_dist := math.max(sl_dist, 0.0)
+    sl_dist_pips = (sl_dist / pip_val) + estimated_spread
     final_sl_dist_pips = math.max(sl_dist_pips, min_sl_pips)
     
     final_sl = is_long ? entry_price - final_sl_dist_pips * pip_val : entry_price + final_sl_dist_pips * pip_val
-    final_tp = is_long ? entry_price + final_sl_dist_pips * rrr * pip_val : entry_price - final_sl_dist_pips * rrr * pip_val
+    final_tp = is_long ? entry_price + final_sl_dist_pips * rrr_val * pip_val : entry_price - final_sl_dist_pips * rrr_val * pip_val
     [final_sl, final_tp]
+
+// Calcula el tamaño exacto del lote basándose en el estándar de Forex (1 lote = $10/pip para XXX/USD)
+// Valida además que con el lote mínimo de 0.01 el riesgo real no exceda 2 * risk_pct (Evita bloqueo arbitrario de SL amplios)
+f_calculate_position_size(entry_price, sl_price) =>
+    sl_dist = math.abs(entry_price - sl_price)
+    pip_val = f_pip_size()
+    sl_dist_pips = sl_dist / pip_val
+    if sl_dist_pips <= 0
+        [0.0, 0.0]
+    else
+        loss_amount = strategy.equity * (risk_pct / 100.0)
+        // Estándar de Forex para pares con cotización en USD: 1 Lote Estándar = $10 USD por pip
+        qty_lots = loss_amount / (sl_dist_pips * 10.0)
+        
+        // Validación de riesgo real explícita con lote mínimo de 0.01
+        actual_risk = 0.01 * sl_dist_pips * 10.0
+        max_allowed_risk = 2.0 * loss_amount
+        
+        if actual_risk > max_allowed_risk
+            [0.0, 0.0] // Lote mínimo excede 2x riesgo permitido - no entrar
+        else
+            final_lot = math.max(0.01, math.round(qty_lots, 2))
+            final_qty = final_lot * 100000.0
+            [final_qty, final_lot]
+
+// Resetea el estado completo del módulo Darvas Box
+f_reset_darvas() =>
+    [float(na), float(na), false, 0, float(na), 0, float(na), 0]
+
+// Calcula el valor máximo de una serie sin usar funciones históricas ta. para permitir su llamada condicional
+f_highest(src, len) =>
+    float max_val = src[0]
+    if len > 1
+        for i = 1 to len - 1
+            max_val := math.max(max_val, src[i])
+    max_val
+
+// Valida si una vela es un Pin Bar alcista endurecido (mecha >= 65% del rango, cuerpo en el 30% superior)
+f_is_bullish_pinbar() =>
+    candle_range = high - low
+    if candle_range <= 0.0
+        false
+    else
+        lower_wick = math.min(open, close) - low
+        wick_ok = lower_wick >= 0.65 * candle_range
+        body_ok = math.min(open, close) >= (high - 0.30 * candle_range)
+        wick_ok and body_ok
+
+// Valida si una vela es un Pin Bar bajista endurecido (mecha >= 65% del rango, cuerpo en el 30% inferior)
+f_is_bearish_pinbar() =>
+    candle_range = high - low
+    if candle_range <= 0.0
+        false
+    else
+        upper_wick = high - math.max(open, close)
+        wick_ok = upper_wick >= 0.65 * candle_range
+        body_ok = math.max(open, close) <= (low + 0.30 * candle_range)
+        wick_ok and body_ok
 
 
 // ==========================================
 // 3. INDICADORES BASE Y CONDICIONES GLOBALES
 // ==========================================
 
-// --- REGLA DE ÁMBITO GLOBAL: CÁLCULOS HISTÓRICOS EN BLOQUE GLOBAL ---
 ema20 = ta.ema(close, ema20_len)
 ema50 = ta.ema(close, ema50_len)
-
-// Máximos y mínimos históricos globales para Darvas y Pullback
-darvas_highest      = ta.highest(high, darvas_length)
-pullback_lowest_5   = ta.lowest(low, 5)
-pullback_highest_5  = ta.highest(high, 5)
+ema200 = ta.ema(close, 200)
+atr14 = ta.atr(14)
 
 // Pivotes históricos globales para S&R Bounce
 ph = ta.pivothigh(high, pivot_len, pivot_len)
 pl = ta.pivotlow(low, pivot_len, pivot_len)
 
-// Condiciones globales no históricas
+// Variables persistentes para el almacenamiento estático de pivotes confirmados
+var float last_pivot_high = na
+var float last_pivot_low  = na
+
+if not na(ph)
+    last_pivot_high := ph
+if not na(pl)
+    last_pivot_low  := pl
+
 pip_size  = f_pip_size()
-spread_ok = estimated_spread <= max_spread
-trend_bullish = ema20 > ema50
-trend_bearish = ema20 < ema50
-in_session = not na(time(timeframe.period, low_liq_session))
+price_above_ema20 = close > ema20
+price_below_ema20 = close < ema20
 is_ny_session = not na(time(timeframe.period, ny_session))
+spread_ok     = estimated_spread <= max_spread
+
+// Invalidación de pivotes históricos si el precio los perfora por más de N pips
+if not na(last_pivot_low) and close < last_pivot_low - pivot_invalidation_pips * pip_size
+    last_pivot_low := na
+if not na(last_pivot_high) and close > last_pivot_high + pivot_invalidation_pips * pip_size
+    last_pivot_high := na
+
+// Filtro de baja liquidez para el módulo S&R
+is_low_liq_session = not na(time(timeframe.period, "1200-1600:23456"))
+sr_session_allowed = not restrict_sr_session or not is_low_liq_session
+
+// Filtro de Drawdown Diario (Daily Loss Limit)
+today_start = time("D")
+float daily_closed_pnl = 0.0
+if strategy.closedtrades > 0
+    for i = 0 to strategy.closedtrades - 1
+        if strategy.closedtrades.exit_time(i) >= today_start
+            daily_closed_pnl := daily_closed_pnl + strategy.closedtrades.profit(i)
+
+open_pnl = strategy.position_size != 0 ? strategy.openprofit : 0.0
+total_daily_pnl = daily_closed_pnl + open_pnl
+daily_loss_limit_reached = total_daily_pnl < - (strategy.equity * (max_daily_loss / 100.0))
+
+// Control de número de operaciones diarias
+is_new_day = ta.change(today_start) != 0
+var int daily_trade_count = 0
+if is_new_day
+    daily_trade_count := 0
+
+is_new_trade_opened = (strategy.position_size != 0 and (na(strategy.position_size[1]) or strategy.position_size[1] == 0))
+if is_new_trade_opened
+    daily_trade_count := daily_trade_count + 1
+
+daily_trades_limit_reached = daily_trade_count >= max_daily_trades
+
+// Filtro de Noticias Macro
+in_news_blackout = false
+if enable_news_filter
+    if news_daily_session != "" and not na(time(timeframe.period, news_daily_session))
+        in_news_blackout := true
+    if (time >= news1_start and time <= news1_end) or (time >= news2_start and time <= news2_end) or (time >= news3_start and time <= news3_end)
+        in_news_blackout := true
+
+// 1. Detección de vencimiento de filtros de noticias macro con bloqueo completo
+news_expired = time > news3_end
+
+// Tracker de Estadísticas por Módulo Aislado
+var float darvas_pnl = 0.0
+var float pullback_pnl = 0.0
+var float sr_pnl = 0.0
+
+var int darvas_trades = 0
+var int pullback_trades = 0
+var int sr_trades = 0
+
+var string closed_strat = ""
+
+// Variable para registrar el último motivo de rechazo de señal
+var string last_rejection_reason = "Ninguno"
 
 
 // ==========================================
@@ -112,8 +270,9 @@ var int   top_candidate_age   = 0
 var float bottom_candidate     = na
 var int   bottom_candidate_age = 0
 
-// Escaneo y creación de cajas estáticas (Cumpliendo la Regla de Ámbito Global)
+// Escaneo y creación de cajas estáticas (Optimizado computacionalmente)
 if enable_darvas and na(box_top)
+    darvas_highest = f_highest(high, darvas_length)
     if high == darvas_highest
         top_candidate        := high
         top_candidate_age    := 0
@@ -129,7 +288,6 @@ if enable_darvas and na(box_top)
             bottom_candidate     := na
             bottom_candidate_age := 0
         else if top_candidate_age >= darvas_length
-            // Buscamos o actualizamos el suelo candidato de forma secuencial sin llamadas históricas condicionales
             if na(bottom_candidate)
                 bottom_candidate     := low
                 bottom_candidate_age := 0
@@ -163,183 +321,477 @@ box_height = not na(box_top) and not na(box_bottom) ? box_top - box_bottom : 0.0
 is_darvas_invalid = false
 
 if waiting_retest
-    // 1. Límite de tiempo
+    // 1. Límite de tiempo (Velas transcurridas sin retestear la caja)
     if bar_index - break_bar_index > darvas_max_retest_bars
         is_darvas_invalid := true
-    // 2. Ruptura del lado contrario de la caja
+        last_rejection_reason := "Darvas: Límite de Tiempo"
+    // 2. Ruptura del lado contrario de la caja (cierre penetra el lado opuesto de la caja confirmada)
     else if retest_direction == 1 and close < box_bottom
         is_darvas_invalid := true
+        last_rejection_reason := "Darvas: Ruptura Lado Contrario"
     else if retest_direction == -1 and close > box_top
         is_darvas_invalid := true
-    // 3. Extensión excesiva sin retesteos
+        last_rejection_reason := "Darvas: Ruptura Lado Contrario"
+    // 3. Extensión excesiva sin retesteos (el precio se aleja demasiado de la caja sin activarla)
     else if retest_direction == 1 and high > box_top + box_height * darvas_invalid_mult
         is_darvas_invalid := true
+        last_rejection_reason := "Darvas: Extensión Excesiva"
     else if retest_direction == -1 and low < box_bottom - box_height * darvas_invalid_mult
         is_darvas_invalid := true
+        last_rejection_reason := "Darvas: Extensión Excesiva"
 
-// REINICIO DIRECTO INLINE (Solución al error CE10088)
+// Reinicio de estado mediante la función centralizada única
 if is_darvas_invalid
-    box_top              := na
-    box_bottom           := na
-    waiting_retest       := false
-    retest_direction     := 0
-    top_candidate        := na
-    top_candidate_age    := 0
-    bottom_candidate     := na
-    bottom_candidate_age := 0
+    [t_box_top, t_box_bottom, t_waiting_retest, t_retest_direction, t_top_candidate, t_top_candidate_age, t_bottom_candidate, t_bottom_candidate_age] = f_reset_darvas()
+    box_top := t_box_top
+    box_bottom := t_box_bottom
+    waiting_retest := t_waiting_retest
+    retest_direction := t_retest_direction
+    top_candidate := t_top_candidate
+    top_candidate_age := t_top_candidate_age
+    bottom_candidate := t_bottom_candidate
+    bottom_candidate_age := t_bottom_candidate_age
 
-// Señales y Entradas del Módulo 1 (Retesteo)
-bool darvas_buy_signal  = false
-bool darvas_sell_signal = false
-float darvas_sl         = na
-float darvas_tp         = na
 
-if enable_darvas and is_ny_session and waiting_retest and not is_darvas_invalid
-    // Velas de rechazo (Pin Bar / Envolvente)
-    lower_wick = math.min(open, close) - low
-    upper_wick = high - math.max(open, close)
-    body       = math.abs(close - open)
+// ==========================================
+// 5. EVALUACIÓN Y PRIORIDAD DE SEÑALES (JERARQUÍA DE ENTRADAS)
+// ==========================================
+
+// Variables persistentes para el control dinámico y seguimiento de la posición abierta
+var float active_raw_sl_dist_pips = na
+var float active_calculated_sl = na
+var float active_calculated_tp = na
+var float active_lot = na
+var string active_strat = ""
+var int active_magic = 0
+var string active_entry_id = ""
+var float trade_peak = na
+var bool trailing_active = false
+var bool break_even_active = false
+var bool prev_trailing_active = false
+
+// Guardar la estrategia del trade actual para estadísticas
+if strategy.position_size != 0
+    closed_strat := active_strat
+
+// Señales en crudo por cada módulo
+bool raw_darvas_buy = false
+bool raw_darvas_sell = false
+bool raw_pullback_buy = false
+bool raw_pullback_sell = false
+bool raw_sr_buy = false
+bool raw_sr_sell = false
+
+// 1. Módulo 1 (Darvas Box)
+if enable_darvas and is_ny_session and waiting_retest and not is_darvas_invalid and strategy.opentrades == 0
+    is_bull_pin = f_is_bullish_pinbar()
+    is_bear_pin = f_is_bearish_pinbar()
     
-    is_bullish_pinbar     = (lower_wick >= body * 1.5) and (lower_wick > upper_wick)
     is_bullish_engulfing  = (close[1] < open[1]) and (close > open) and (close >= open[1]) and (open <= close[1])
-    is_bearish_pinbar     = (upper_wick >= body * 1.5) and (upper_wick > lower_wick)
     is_bearish_engulfing  = (close[1] > open[1]) and (close < open) and (close <= open[1]) and (open >= close[1])
+    
+    // Filtro de tamaño mínimo del cuerpo de vela envolvente
+    if is_bullish_engulfing and not (math.abs(close - open) >= engulfing_min_atr_factor * atr14)
+        is_bullish_engulfing := false
+    if is_bearish_engulfing and not (math.abs(close - open) >= engulfing_min_atr_factor * atr14)
+        is_bearish_engulfing := false
 
     if retest_direction == 1 and low <= box_top
-        if (is_bullish_pinbar or is_bullish_engulfing) and barstate.isconfirmed and spread_ok and strategy.position_size == 0
-            raw_sl = box_bottom - buffer_pips * pip_size
-            [sl, tp] = f_calc_sl_tp(close, raw_sl, true)
-            darvas_sl := sl
-            darvas_tp := tp
-            darvas_buy_signal := true
-            
-            alert_msg = f_build_json("buy", close, sl, tp, "Darvas Box Break & Retest")
-            strategy.entry("Darvas_Long", strategy.long, alert_message=alert_msg)
-            strategy.exit("Exit_Darvas_Long", from_entry="Darvas_Long", stop=sl, limit=tp)
-            
-            // Reinicio inline post-operación larga
-            box_top              := na
-            box_bottom           := na
-            waiting_retest       := false
-            retest_direction     := 0
-            top_candidate        := na
-            top_candidate_age    := 0
-            bottom_candidate     := na
-            bottom_candidate_age := 0
-            
+        if (is_bull_pin or is_bullish_engulfing) and barstate.isconfirmed
+            raw_darvas_buy := true
     else if retest_direction == -1 and high >= box_bottom
-        if (is_bearish_pinbar or is_bearish_engulfing) and barstate.isconfirmed and spread_ok and strategy.position_size == 0
-            raw_sl = box_top + buffer_pips * pip_size
-            [sl, tp] = f_calc_sl_tp(close, raw_sl, false)
-            darvas_sl := sl
-            darvas_tp := tp
-            darvas_sell_signal := true
-            
-            alert_msg = f_build_json("sell", close, sl, tp, "Darvas Box Break & Retest")
-            strategy.entry("Darvas_Short", strategy.short, alert_message=alert_msg)
-            strategy.exit("Exit_Darvas_Short", from_entry="Darvas_Short", stop=sl, limit=tp)
-            
-            // Reinicio inline post-operación corta
-            box_top              := na
-            box_bottom           := na
-            waiting_retest       := false
-            retest_direction     := 0
-            top_candidate        := na
-            top_candidate_age    := 0
-            bottom_candidate     := na
-            bottom_candidate_age := 0
+        if (is_bear_pin or is_bearish_engulfing) and barstate.isconfirmed
+            raw_darvas_sell := true
 
-// ==========================================
-// 5. MÓDULO 2: TREND PULLBACK
-// ==========================================
-
-bool pullback_buy_signal  = false
-bool pullback_sell_signal = false
-
-if enable_pullback and is_ny_session and strategy.position_size == 0 and barstate.isconfirmed and spread_ok
-    if trend_bullish
-        // Precio interactúa con la EMA 20 y cierra de forma alcista por encima de ella
+// 2. Módulo 2 (Trend Pullback)
+if enable_pullback and is_ny_session and strategy.opentrades == 0 and barstate.isconfirmed
+    local_bull = ema20 > ema50
+    local_bear = ema20 < ema50
+    
+    if price_above_ema20 and local_bull
         low_touch = low <= ema20 + pullback_tolerance * pip_size
         if low_touch and close > ema20 and close > open
-            raw_sl = pullback_lowest_5 - buffer_pips * pip_size
-            [sl, tp] = f_calc_sl_tp(close, raw_sl, true)
-            pullback_buy_signal := true
-            
-            alert_msg = f_build_json("buy", close, sl, tp, "Trend Pullback")
-            strategy.entry("Pullback_Long", strategy.long, alert_message=alert_msg)
-            strategy.exit("Exit_Pullback_Long", from_entry="Pullback_Long", stop=sl, limit=tp)
-            
-    else if trend_bearish
-        // Precio interactúa con la EMA 20 y cierra de forma bajista por debajo de ella
+            raw_pullback_buy := true
+    else if price_below_ema20 and local_bear
         high_touch = high >= ema20 - pullback_tolerance * pip_size
         if high_touch and close < ema20 and close < open
-            raw_sl = pullback_highest_5 + buffer_pips * pip_size
-            [sl, tp] = f_calc_sl_tp(close, raw_sl, false)
-            pullback_sell_signal := true
-            
-            alert_msg = f_build_json("sell", close, sl, tp, "Trend Pullback")
-            strategy.entry("Pullback_Short", strategy.short, alert_message=alert_msg)
-            strategy.exit("Exit_Pullback_Short", from_entry="Pullback_Short", stop=sl, limit=tp)
+            raw_pullback_sell := true
 
+// 3. Módulo 3 (S&R Bounce)
+if enable_sr and strategy.opentrades == 0 and barstate.isconfirmed
+    is_bull_pin = f_is_bullish_pinbar()
+    is_bear_pin = f_is_bearish_pinbar()
 
-// ==========================================
-// 6. MÓDULO 3: S&R BOUNCE (BAJA LIQUIDEZ)
-// ==========================================
+    // Comprobación de que el precio haya cruzado el pivote y cerrado al menos N pips por encima/debajo
+    if not na(last_pivot_low) and low <= last_pivot_low and close >= last_pivot_low + sr_min_distance_pips * pip_size and is_bull_pin
+        raw_sr_buy := true
+    else if not na(last_pivot_high) and high >= last_pivot_high and close <= last_pivot_high - sr_min_distance_pips * pip_size and is_bear_pin
+        raw_sr_sell := true
 
-// Variables persistentes para el almacenamiento estático de pivotes confirmados en el pasado
-var float last_pivot_high = na
-var float last_pivot_low  = na
-
-// Se actualizan únicamente cuando se confirma un pivote (evitando look-ahead lag)
-if not na(ph)
-    last_pivot_high := ph
-if not na(pl)
-    last_pivot_low  := pl
-
-bool sr_buy_signal  = false
+// Jerarquía y Resolución de Concurrencia de Señales: Darvas > Pullback > S&R
+bool darvas_buy_signal = false
+bool darvas_sell_signal = false
+bool pullback_buy_signal = false
+bool pullback_sell_signal = false
+bool sr_buy_signal = false
 bool sr_sell_signal = false
 
-if enable_sr and in_session and strategy.position_size == 0 and barstate.isconfirmed and spread_ok
-    if not na(last_pivot_low) and low <= last_pivot_low and close > last_pivot_low
-        // Validar vela con mecha larga de rechazo (Pin Bar alcista)
-        lower_wick = math.min(open, close) - low
-        upper_wick = high - math.max(open, close)
-        body       = math.abs(close - open)
-        is_bullish_pinbar = (lower_wick >= body * 1.5) and (lower_wick > upper_wick)
-        
-        if is_bullish_pinbar
-            raw_sl = last_pivot_low - buffer_pips * pip_size
-            [sl, tp] = f_calc_sl_tp(close, raw_sl, true)
-            sr_buy_signal := true
-            
-            alert_msg = f_build_json("buy", close, sl, tp, "S&R Bounce")
-            strategy.entry("SR_Long", strategy.long, alert_message=alert_msg)
-            strategy.exit("Exit_SR_Long", from_entry="SR_Long", stop=sl, limit=tp)
-            
-    else if not na(last_pivot_high) and high >= last_pivot_high and close < last_pivot_high
-        // Validar vela con mecha larga de rechazo (Pin Bar bajista)
-        upper_wick = high - math.max(open, close)
-        lower_wick = math.min(open, close) - low
-        body       = math.abs(close - open)
-        is_bearish_pinbar = (upper_wick >= body * 1.5) and (upper_wick > lower_wick)
-        
-        if is_bearish_pinbar
-            raw_sl = last_pivot_high + buffer_pips * pip_size
-            [sl, tp] = f_calc_sl_tp(close, raw_sl, false)
-            sr_sell_signal := true
-            
-            alert_msg = f_build_json("sell", close, sl, tp, "S&R Bounce")
-            strategy.entry("SR_Short", strategy.short, alert_message=alert_msg)
-            strategy.exit("Exit_SR_Short", from_entry="SR_Short", stop=sl, limit=tp)
+if raw_darvas_buy
+    darvas_buy_signal := true
+else if raw_darvas_sell
+    darvas_sell_signal := true
+else if raw_pullback_buy
+    pullback_buy_signal := true
+else if raw_pullback_sell
+    pullback_sell_signal := true
+else if raw_sr_buy
+    sr_buy_signal := true
+else if raw_sr_sell
+    sr_sell_signal := true
 
 
 // ==========================================
-// 7. SEÑALES Y GRÁFICOS EN PANTALLA
+// 6. DISPARADORES DE ENTRADA (EXECUTION BLOCKS)
+// ==========================================
+
+// --- Entrada Darvas Box Long ---
+if darvas_buy_signal
+    if not spread_ok
+        last_rejection_reason := "Darvas: Spread Excesivo"
+    else if daily_loss_limit_reached
+        last_rejection_reason := "Darvas: Límite Pérdidas Diario"
+    else if daily_trades_limit_reached
+        last_rejection_reason := "Darvas: Límite Trades Diario"
+    else if in_news_blackout
+        last_rejection_reason := "Darvas: Bloqueo por Noticias"
+    else if news_expired
+        last_rejection_reason := "FILTROS DE NOTICIAS VENCIDOS — ACTUALIZAR"
+    else
+        raw_sl = box_bottom
+        [sl, tp] = f_calc_sl_tp(close, raw_sl, true, darvas_rrr)
+        [qty, lot] = f_calculate_position_size(close, sl)
+        
+        if lot > 0 and not na(sl)
+            active_strat := "Darvas Box Break & Retest"
+            active_magic := 1001
+            active_lot := lot
+            active_raw_sl_dist_pips := math.abs(close - raw_sl) / pip_size
+            active_entry_id := "Long_Trade"
+            
+            strategy.entry(active_entry_id, strategy.long, qty=qty)
+            
+            // Reiniciar caja Darvas inmediatamente tras enviar la orden
+            [t_box_top, t_box_bottom, t_waiting_retest, t_retest_direction, t_top_candidate, t_top_candidate_age, t_bottom_candidate, t_bottom_candidate_age] = f_reset_darvas()
+            box_top := t_box_top
+            box_bottom := t_box_bottom
+            waiting_retest := t_waiting_retest
+            retest_direction := t_retest_direction
+            top_candidate := t_top_candidate
+            top_candidate_age := t_top_candidate_age
+            bottom_candidate := t_bottom_candidate
+            bottom_candidate_age := t_bottom_candidate_age
+
+// --- Entrada Darvas Box Short ---
+if darvas_sell_signal
+    if not spread_ok
+        last_rejection_reason := "Darvas: Spread Excesivo"
+    else if daily_loss_limit_reached
+        last_rejection_reason := "Darvas: Límite Pérdidas Diario"
+    else if daily_trades_limit_reached
+        last_rejection_reason := "Darvas: Límite Trades Diario"
+    else if in_news_blackout
+        last_rejection_reason := "Darvas: Bloqueo por Noticias"
+    else if news_expired
+        last_rejection_reason := "FILTROS DE NOTICIAS VENCIDOS — ACTUALIZAR"
+    else
+        raw_sl = box_top
+        [sl, tp] = f_calc_sl_tp(close, raw_sl, false, darvas_rrr)
+        [qty, lot] = f_calculate_position_size(close, sl)
+        
+        if lot > 0 and not na(sl)
+            active_strat := "Darvas Box Break & Retest"
+            active_magic := 1002
+            active_lot := lot
+            active_raw_sl_dist_pips := math.abs(close - raw_sl) / pip_size
+            active_entry_id := "Short_Trade"
+            
+            strategy.entry(active_entry_id, strategy.short, qty=qty)
+            
+            // Reiniciar caja Darvas inmediatamente tras enviar la orden
+            [t_box_top, t_box_bottom, t_waiting_retest, t_retest_direction, t_top_candidate, t_top_candidate_age, t_bottom_candidate, t_bottom_candidate_age] = f_reset_darvas()
+            box_top := t_box_top
+            box_bottom := t_box_bottom
+            waiting_retest := t_waiting_retest
+            retest_direction := t_retest_direction
+            top_candidate := t_top_candidate
+            top_candidate_age := t_top_candidate_age
+            bottom_candidate := t_bottom_candidate
+            bottom_candidate_age := t_bottom_candidate_age
+
+// --- Entrada Trend Pullback Long ---
+if pullback_buy_signal
+    if not (close > ema200)
+        last_rejection_reason := "PB Long: Precio < EMA200"
+    else if not spread_ok
+        last_rejection_reason := "PB Long: Spread Excesivo"
+    else if daily_loss_limit_reached
+        last_rejection_reason := "PB Long: Límite Pérdidas Diario"
+    else if daily_trades_limit_reached
+        last_rejection_reason := "PB Long: Límite Trades Diario"
+    else if in_news_blackout
+        last_rejection_reason := "PB Long: Bloqueo por Noticias"
+    else if news_expired
+        last_rejection_reason := "FILTROS DE NOTICIAS VENCIDOS — ACTUALIZAR"
+    else
+        // Stop Loss estructural con protección ATR y distancia estructural mínima (5 velas)
+        atr_dist = atr14 * pullback_atr_mult
+        struct_dist = close - ta.lowest(low, 5)
+        final_dist = math.max(atr_dist, struct_dist)
+        raw_sl = close - final_dist
+        
+        if not na(raw_sl)
+            [sl, tp] = f_calc_sl_tp(close, raw_sl, true, pullback_rrr)
+            [qty, lot] = f_calculate_position_size(close, sl)
+            
+            if lot > 0 and not na(sl)
+                active_strat := "Trend Pullback"
+                active_magic := 2001
+                active_lot := lot
+                active_raw_sl_dist_pips := math.abs(close - raw_sl) / pip_size
+                active_entry_id := "Long_Trade"
+                
+                strategy.entry(active_entry_id, strategy.long, qty=qty)
+
+// --- Entrada Trend Pullback Short ---
+if pullback_sell_signal
+    if not (close < ema200)
+        last_rejection_reason := "PB Short: Precio > EMA200"
+    else if not spread_ok
+        last_rejection_reason := "PB Short: Spread Excesivo"
+    else if daily_loss_limit_reached
+        last_rejection_reason := "PB Short: Límite Pérdidas Diario"
+    else if daily_trades_limit_reached
+        last_rejection_reason := "PB Short: Límite Trades Diario"
+    else if in_news_blackout
+        last_rejection_reason := "PB Short: Bloqueo por Noticias"
+    else if news_expired
+        last_rejection_reason := "FILTROS DE NOTICIAS VENCIDOS — ACTUALIZAR"
+    else
+        // Stop Loss estructural con protección ATR y distancia estructural mínima (5 velas)
+        atr_dist = atr14 * pullback_atr_mult
+        struct_dist = ta.highest(high, 5) - close
+        final_dist = math.max(atr_dist, struct_dist)
+        raw_sl = close + final_dist
+        
+        if not na(raw_sl)
+            [sl, tp] = f_calc_sl_tp(close, raw_sl, false, pullback_rrr)
+            [qty, lot] = f_calculate_position_size(close, sl)
+            
+            if lot > 0 and not na(sl)
+                active_strat := "Trend Pullback"
+                active_magic := 2002
+                active_lot := lot
+                active_raw_sl_dist_pips := math.abs(close - raw_sl) / pip_size
+                active_entry_id := "Short_Trade"
+                
+                strategy.entry(active_entry_id, strategy.short, qty=qty)
+
+// --- Entrada S&R Bounce Long ---
+if sr_buy_signal
+    if not sr_session_allowed
+        last_rejection_reason := "S&R: Sesión Baja Liquidez"
+    else if not (close > ema200)
+        last_rejection_reason := "S&R Long: Precio < EMA200"
+    else if not spread_ok
+        last_rejection_reason := "S&R Long: Spread Excesivo"
+    else if daily_loss_limit_reached
+        last_rejection_reason := "S&R Long: Límite Pérdidas Diario"
+    else if daily_trades_limit_reached
+        last_rejection_reason := "S&R Long: Límite Trades Diario"
+    else if in_news_blackout
+        last_rejection_reason := "S&R Long: Bloqueo por Noticias"
+    else if news_expired
+        last_rejection_reason := "FILTROS DE NOTICIAS VENCIDOS — ACTUALIZAR"
+    else
+        raw_sl = last_pivot_low - buffer_pips * pip_size
+        if not na(raw_sl)
+            [sl, tp] = f_calc_sl_tp(close, raw_sl, true, sr_rrr)
+            [qty, lot] = f_calculate_position_size(close, sl)
+            
+            if lot > 0 and not na(sl)
+                active_strat := "S&R Bounce"
+                active_magic := 3001
+                active_lot := lot
+                active_raw_sl_dist_pips := math.abs(close - raw_sl) / pip_size
+                active_entry_id := "Long_Trade"
+                
+                strategy.entry(active_entry_id, strategy.long, qty=qty)
+            
+// --- Entrada S&R Bounce Short ---
+if sr_sell_signal
+    if not sr_session_allowed
+        last_rejection_reason := "S&R: Sesión Baja Liquidez"
+    else if not (close < ema200)
+        last_rejection_reason := "S&R Short: Precio > EMA200"
+    else if not spread_ok
+        last_rejection_reason := "S&R Short: Spread Excesivo"
+    else if daily_loss_limit_reached
+        last_rejection_reason := "S&R Short: Límite Pérdidas Diario"
+    else if daily_trades_limit_reached
+        last_rejection_reason := "S&R Short: Límite Trades Diario"
+    else if in_news_blackout
+        last_rejection_reason := "S&R Short: Bloqueo por Noticias"
+    else if news_expired
+        last_rejection_reason := "FILTROS DE NOTICIAS VENCIDOS — ACTUALIZAR"
+    else
+        raw_sl = last_pivot_high + buffer_pips * pip_size
+        if not na(raw_sl)
+            [sl, tp] = f_calc_sl_tp(close, raw_sl, false, sr_rrr)
+            [qty, lot] = f_calculate_position_size(close, sl)
+            
+            if lot > 0 and not na(sl)
+                active_strat := "S&R Bounce"
+                active_magic := 3002
+                active_lot := lot
+                active_raw_sl_dist_pips := math.abs(close - raw_sl) / pip_size
+                active_entry_id := "Short_Trade"
+                
+                strategy.entry(active_entry_id, strategy.short, qty=qty)
+
+
+// ==========================================
+// 7. GESTIÓN DINÁMICA DE SALIDAS (TRAILING & VALIDATION)
+// ==========================================
+
+if strategy.position_size != 0
+    is_long_trade = strategy.position_size > 0
+    entry_price_val = strategy.opentrades.entry_price(0)
+    
+    // Inicialización del pico de precio con el precio de entrada real
+    if na(trade_peak)
+        trade_peak := entry_price_val
+        trailing_active := false
+        break_even_active := false
+    else
+        trade_peak := is_long_trade ? math.max(trade_peak, high) : math.min(trade_peak, low)
+    
+    // Recalculo del SL de forma robusta utilizando el entry_price_val y la distancia en pips
+    // para evitar distorsiones causadas por gaps
+    actual_raw_sl = entry_price_val + (is_long_trade ? -1 : 1) * active_raw_sl_dist_pips * pip_size
+    
+    // Recalcular los niveles de SL y TP basándose en el precio de entrada real de apertura
+    current_rrr = active_strat == "Darvas Box Break & Retest" ? darvas_rrr : active_strat == "Trend Pullback" ? pullback_rrr : sr_rrr
+    [sl_level, tp_level] = f_calc_sl_tp(entry_price_val, actual_raw_sl, is_long_trade, current_rrr)
+    
+    if na(active_calculated_sl)
+        active_calculated_sl := sl_level
+        active_calculated_tp := tp_level
+        
+    // Lógica intermedia de Break-Even (se activa al superar la relación RRR 1:1)
+    initial_sl_dist = math.abs(entry_price_val - actual_raw_sl)
+    be_trigger_price = entry_price_val + (is_long_trade ? 1 : -1) * initial_sl_dist
+    
+    if not break_even_active and (is_long_trade ? high >= be_trigger_price : low <= be_trigger_price)
+        break_even_active := true
+        
+    // Mover el Stop Loss a Break-Even (cubriendo spread del broker)
+    float base_sl_level = active_calculated_sl
+    if break_even_active
+        be_sl_price = entry_price_val + (is_long_trade ? 1 : -1) * estimated_spread * pip_size
+        base_sl_level := is_long_trade ? math.max(active_calculated_sl, be_sl_price) : math.min(active_calculated_sl, be_sl_price)
+        
+    // Hito de activación del Trailing Stop
+    milestone = entry_price_val + (is_long_trade ? 1 : -1) * initial_sl_dist * trailing_activation_rrr
+    
+    if enable_trailing and not trailing_active and (is_long_trade ? high >= milestone : low <= milestone)
+        trailing_active := true
+        
+    // Calcular el nivel del trailing stop utilizando el ATR adaptativo
+    float trail_sl_level = na
+    if enable_trailing and trailing_active
+        trail_sl_level := is_long_trade ? trade_peak - atr14 * trailing_distance_atr : trade_peak + atr14 * trailing_distance_atr
+        
+    // El trailing stop sólo se mueve en la dirección de la operación
+    float final_sl_level = base_sl_level
+    if enable_trailing and trailing_active and not na(trail_sl_level)
+        if is_long_trade
+            final_sl_level := math.max(base_sl_level, trail_sl_level)
+        else
+            final_sl_level := math.min(base_sl_level, trail_sl_level)
+            
+    active_calculated_sl := final_sl_level
+    
+    // TP dinámico: se anula el límite una vez activo el trailing
+    exit_limit_level = (enable_trailing and trailing_active) ? na : active_calculated_tp
+    
+    // Validación de seguridad de la orden de salida
+    isValidExit = not na(final_sl_level) and final_sl_level > 0
+    if not na(exit_limit_level)
+        isValidExit := isValidExit and exit_limit_level > 0 and final_sl_level != exit_limit_level
+        
+    sl_dist_actual_pips = math.abs(entry_price_val - final_sl_level) / pip_size
+    isValidExit := isValidExit and (sl_dist_actual_pips >= min_sl_pips)
+    
+    if isValidExit
+        // Cancelar la orden previa antes de cambiar la salida de TP a Trailing para evitar órdenes colgadas en el broker
+        if trailing_active and not prev_trailing_active
+            strategy.cancel("Exit_TP")
+            
+        if trailing_active
+            strategy.exit("Exit_Trail", from_entry=active_entry_id, stop=final_sl_level)
+        else
+            strategy.exit("Exit_TP", from_entry=active_entry_id, stop=final_sl_level, limit=exit_limit_level)
+            
+    prev_trailing_active := trailing_active
+    
+    // Alerta de Margin Call Potencial
+    if enable_margin_protection
+        margin_required = (math.abs(strategy.position_size) * close) / leverage
+        if strategy.equity < margin_required * (margin_threshold_pct / 100.0)
+            strategy.close_all(comment="Protección Margin Call")
+            last_rejection_reason := "Exit: Margin Call Prevenido"
+
+// Resetear variables únicamente al cerrarse la posición (evita reseteo prematuro en barra de señal)
+is_position_just_closed = (strategy.position_size == 0 and strategy.position_size[1] != 0)
+if is_position_just_closed
+    active_calculated_sl := na
+    active_calculated_tp := na
+    active_lot := na
+    active_strat := ""
+    active_magic := 0
+    active_entry_id := ""
+    active_raw_sl_dist_pips := na
+    trade_peak := na
+    trailing_active := false
+    prev_trailing_active := false
+    break_even_active := false
+
+// Envío único del Payload Webhook Web enriquecido al ocurrir el llenado real
+is_new_trade_opened_alert = (strategy.position_size != 0 and (na(strategy.position_size[1]) or strategy.position_size[1] == 0))
+if is_new_trade_opened_alert
+    is_l = strategy.position_size > 0
+    ep = strategy.opentrades.entry_price(0)
+    curr_rrr = active_strat == "Darvas Box Break & Retest" ? darvas_rrr : active_strat == "Trend Pullback" ? pullback_rrr : sr_rrr
+    
+    // Obtener actual_raw_sl para recalcular los niveles correspondientes del alert
+    act_raw_sl = ep + (is_l ? -1 : 1) * active_raw_sl_dist_pips * pip_size
+    [sl_act, tp_act] = f_calc_sl_tp(ep, act_raw_sl, is_l, curr_rrr)
+    
+    // Generar un Magic Number único para evitar duplicados en n8n
+    dynamic_magic = active_magic * 1000 + daily_trade_count
+    
+    actual_alert_msg = f_build_json(is_l ? "BUY" : "SELL", syminfo.ticker, active_lot, ep, sl_act, tp_act, active_strat, dynamic_magic, time)
+    alert(actual_alert_msg, alert.freq_once_per_bar)
+
+
+// ==========================================
+// 8. GRÁFICOS Y CONSOLA DE AUDITORÍA VISUAL
 // ==========================================
 
 // Dibujo de EMAs
 plot(ema20, color=color.new(color.blue, 10), title="EMA 20 Rápida", linewidth=2)
-plot(ema50, color=color.new(color.orange, 10), title="EMA 50 Lenta", linewidth=2)
+plot(ema50, color=color.new(color.orange, 15), title="EMA 50 Lenta", linewidth=2)
+plot(ema200, color=color.new(color.purple, 30), title="EMA 200 Macro", linewidth=2)
 
 // Dibujo de Cajas Darvas (Estáticas)
 plot(box_top, color=not na(box_top) ? color.green : color.new(color.white, 100), style=plot.style_linebr, linewidth=2, title="Darvas Techo")
@@ -349,8 +801,11 @@ plot(box_bottom, color=not na(box_bottom) ? color.red : color.new(color.white, 1
 plot(last_pivot_high, color=not na(last_pivot_high) ? color.new(color.red, 40) : color.new(color.white, 100), style=plot.style_linebr, linewidth=1, title="Pivot Resistencia")
 plot(last_pivot_low, color=not na(last_pivot_low) ? color.new(color.green, 40) : color.new(color.white, 100), style=plot.style_linebr, linewidth=1, title="Pivot Soporte")
 
+// Dibujo dinámico de niveles de Stop Loss y Take Profit activos en la posición
+plot(strategy.position_size != 0 ? active_calculated_sl : na, color=color.new(color.red, 20), style=plot.style_linebr, linewidth=2, title="SL Activo")
+plot(strategy.position_size != 0 ? active_calculated_tp : na, color=color.new(color.green, 20), style=plot.style_linebr, linewidth=2, title="TP Activo")
+
 // Sombreado de las sesiones de operación
-bgcolor(in_session ? color.new(color.yellow, 95) : na, title="Sesión de Operación S&R")
 bgcolor(is_ny_session ? color.new(color.blue, 96) : na, title="Sesión de Operación NY")
 
 // Señales visuales de compra y venta
@@ -362,3 +817,52 @@ plotshape(pullback_sell_signal, title="Entrada Pullback Venta", style=shape.labe
 
 plotshape(sr_buy_signal, title="Entrada S&R Compra", style=shape.diamond, location=location.belowbar, color=color.purple, size=size.small)
 plotshape(sr_sell_signal, title="Entrada S&R Venta", style=shape.diamond, location=location.abovebar, color=color.purple, size=size.small)
+
+// Configuración de la Consola de Auditoría (Tabla Flotante)
+var table audit_table = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 30), border_color=color.gray, border_width=1)
+
+ema200_trend_str = close > ema200 ? "Alcista (L Permite)" : "Bajista (S Permite)"
+ema200_color = close > ema200 ? color.green : color.red
+
+daily_dd_str = daily_loss_limit_reached ? "Excedido (Block)" : "OK"
+daily_dd_color = daily_loss_limit_reached ? color.red : color.green
+
+news_str = news_expired ? "FILTRO VENCIDO" : in_news_blackout ? "Bloqueado" : "OK"
+news_color = news_expired ? color.orange : in_news_blackout ? color.red : color.green
+
+session_str = is_ny_session ? "NY Activa" : is_low_liq_session ? (restrict_sr_session ? "Baja Liquidez (Block)" : "Baja Liquidez (S&R)") : "Fuera de Sesión"
+session_color = is_ny_session ? color.blue : is_low_liq_session ? (restrict_sr_session ? color.red : color.orange) : color.gray
+
+darvas_state_str = not na(box_top) ? (f_format_price(box_top) + " - " + f_format_price(box_bottom)) : "Buscando..."
+darvas_state_color = not na(box_top) ? color.green : color.orange
+
+// Renderizado de la tabla en pantalla (incluyendo trade trackers y PnL por módulo)
+table.cell(audit_table, 0, 0, "Consola de Auditoría 2026", text_color=color.white, text_size=size.small, bgcolor=color.navy)
+table.cell(audit_table, 1, 0, syminfo.ticker, text_color=color.white, text_size=size.small, bgcolor=color.navy)
+
+table.cell(audit_table, 0, 1, "Tendencia EMA 200", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
+table.cell(audit_table, 1, 1, ema200_trend_str, text_color=color.white, text_size=size.small, bgcolor=ema200_color)
+
+table.cell(audit_table, 0, 2, "Drawdown / Trades Hoy", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
+table.cell(audit_table, 1, 2, daily_dd_str + " (" + str.tostring(daily_trade_count) + "/" + str.tostring(max_daily_trades) + ")", text_color=color.white, text_size=size.small, bgcolor=daily_dd_color)
+
+table.cell(audit_table, 0, 3, "Noticias Macro", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
+table.cell(audit_table, 1, 3, news_str, text_color=color.white, text_size=size.small, bgcolor=news_color)
+
+table.cell(audit_table, 0, 4, "Sesión de Liquidez", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
+table.cell(audit_table, 1, 4, session_str, text_color=color.white, text_size=size.small, bgcolor=session_color)
+
+table.cell(audit_table, 0, 5, "Darvas Box State", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
+table.cell(audit_table, 1, 5, darvas_state_str, text_color=color.white, text_size=size.small, bgcolor=darvas_state_color)
+
+table.cell(audit_table, 0, 6, "Darvas PnL / Trades", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
+table.cell(audit_table, 1, 6, str.tostring(darvas_pnl, "#.##") + " USD (" + str.tostring(darvas_trades) + ")", text_color=color.white, text_size=size.small, bgcolor=darvas_trades == 0 ? color.gray : darvas_pnl >= 0 ? color.green : color.red)
+
+table.cell(audit_table, 0, 7, "Pullback PnL / Trades", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
+table.cell(audit_table, 1, 7, str.tostring(pullback_pnl, "#.##") + " USD (" + str.tostring(pullback_trades) + ")", text_color=color.white, text_size=size.small, bgcolor=pullback_trades == 0 ? color.gray : pullback_pnl >= 0 ? color.green : color.red)
+
+table.cell(audit_table, 0, 8, "S&R Bounce PnL / Trades", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
+table.cell(audit_table, 1, 8, str.tostring(sr_pnl, "#.##") + " USD (" + str.tostring(sr_trades) + ")", text_color=color.white, text_size=size.small, bgcolor=sr_trades == 0 ? color.gray : sr_pnl >= 0 ? color.green : color.red)
+
+table.cell(audit_table, 0, 9, "Último Evento/Rechazo", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
+table.cell(audit_table, 1, 9, last_rejection_reason, text_color=color.white, text_size=size.small, bgcolor=color.maroon)

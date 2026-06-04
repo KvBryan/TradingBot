@@ -66,6 +66,7 @@ builder.Services.AddDbContext<TradingBotDbContext>(options =>
 
 // Registrar CapitalComService como Scoped
 builder.Services.AddScoped<CapitalComService>();
+builder.Services.AddHostedService<CapitalComSyncWorker>();
 
 // Configuración de JWT
 var jwtSecretKey = Environment.GetEnvironmentVariable("JWT_SECRET_KEY");
@@ -161,8 +162,11 @@ app.MapWebhookEndpoints();
 app.MapHub<TradeHub>("/hubs/trades").RequireAuthorization("DashboardPolicy");
 
 // REST endpoints para el Dashboard
-app.MapGet("/api/v1/trades", async (TradingBotDbContext dbContext) =>
+app.MapGet("/api/v1/trades", async (TradingBotDbContext dbContext, CapitalComService capitalService) =>
 {
+    // Sincronizar en tiempo real estados activos con Capital.com antes de listar
+    await capitalService.SyncOpenTradesAsync();
+
     var trades = await dbContext.Trades
         .Where(t => !t.IsDeleted)
         .OrderByDescending(t => t.CreatedAt)
@@ -193,18 +197,50 @@ app.MapGet("/api/v1/balance", async (CapitalComService capitalService) =>
     }
 }).RequireAuthorization("DashboardPolicy");
 
-app.MapDelete("/api/v1/trades/{id:guid}", async (Guid id, TradingBotDbContext dbContext, IHubContext<TradeHub> hubContext) =>
+app.MapDelete("/api/v1/trades/{id:guid}", async (
+    Guid id, 
+    TradingBotDbContext dbContext, 
+    CapitalComService capitalService, 
+    IHubContext<TradeHub> hubContext) =>
 {
     var trade = await dbContext.Trades.FindAsync(id);
     if (trade == null) return Results.NotFound();
 
-    trade.IsDeleted = true;
-    await dbContext.SaveChangesAsync();
+    if (string.Equals(trade.Status, "OPEN", StringComparison.OrdinalIgnoreCase))
+    {
+        // 1. Es un trade abierto, por lo tanto "Liquidar" significa cerrarlo en Capital.com
+        bool capitalClosed = false;
+        if (!string.IsNullOrEmpty(trade.DealReference))
+        {
+            capitalClosed = await capitalService.ClosePositionOnCapitalComAsync(trade.DealReference);
+        }
 
-    // Notificar a todos los clientes a través de SignalR
-    await hubContext.Clients.All.SendAsync("TradeUpdated", trade);
+        // 2. Cambiar estado a LIQUIDATED sin borrar de la base de datos (mantiene IsDeleted = false)
+        trade.Status = "LIQUIDATED";
+        trade.ProfitLoss = 0; // Opcional o se puede calcular
+        await dbContext.SaveChangesAsync();
 
-    return Results.Ok(new { success = true, message = "Trade soft-deleted successfully" });
+        // 3. Notificar vía SignalR
+        await hubContext.Clients.All.SendAsync("TradeUpdated", trade);
+
+        return Results.Ok(new { 
+            success = true, 
+            message = capitalClosed 
+                ? "Position liquidated successfully in Capital.com and database." 
+                : "Position marked as Liquidated in database (Capital.com close was skipped or failed)." 
+        });
+    }
+    else
+    {
+        // Es un trade ya cerrado o liquidado, el usuario quiere eliminarlo del historial (borrado lógico)
+        trade.IsDeleted = true;
+        await dbContext.SaveChangesAsync();
+
+        // Notificar vía SignalR
+        await hubContext.Clients.All.SendAsync("TradeUpdated", trade);
+
+        return Results.Ok(new { success = true, message = "Trade removed from history successfully." });
+    }
 }).RequireAuthorization("DashboardPolicy");
 
 // Endpoint de prueba de salud (Health Check)
