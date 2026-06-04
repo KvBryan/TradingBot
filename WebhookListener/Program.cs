@@ -65,6 +65,7 @@ builder.Services.AddDbContext<TradingBotDbContext>(options =>
     options.UseNpgsql(connectionString));
 
 // Registrar CapitalComService como Scoped
+builder.Services.AddSingleton<EconomicCalendarService>();
 builder.Services.AddScoped<CapitalComService>();
 builder.Services.AddHostedService<CapitalComSyncWorker>();
 

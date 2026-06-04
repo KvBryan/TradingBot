@@ -9,6 +9,7 @@ public class CapitalComService
     private readonly TradingBotDbContext _context;
     private readonly ILogger<CapitalComService> _logger;
     private readonly IHubContext<TradeHub> _hubContext;
+    private readonly EconomicCalendarService _calendarService;
     private readonly string _baseUrl;
     private readonly string _apiKey;
     private readonly string _identifier;
@@ -35,12 +36,14 @@ public class CapitalComService
         HttpClient httpClient,
         TradingBotDbContext context,
         ILogger<CapitalComService> logger,
-        IHubContext<TradeHub> hubContext)
+        IHubContext<TradeHub> hubContext,
+        EconomicCalendarService calendarService)
     {
         _httpClient = httpClient;
         _context = context;
         _logger = logger;
         _hubContext = hubContext;
+        _calendarService = calendarService;
 
         // Leer variables de entorno cargadas en la aplicación
         var environment = Environment.GetEnvironmentVariable("CAPITAL_COM_ENVIRONMENT") ?? "DEMO";
@@ -252,6 +255,67 @@ public class CapitalComService
         // 1. Obtener tokens de sesión válidos (reutilización)
         var (cst, securityToken) = await GetSessionTokensAsync();
 
+        // --- NUEVA VALIDACIÓN: Calendario Económico Autónomo (Noticias Macro) ---
+        var isNearNews = await _calendarService.IsNearHighImpactNewsAsync(symbol, DateTime.UtcNow);
+        if (isNearNews)
+        {
+            _logger.LogWarning("Orden de APERTURA para {Symbol} rechazada en C# debido a proximidad con noticia macro de alto impacto (+/- 15 minutos).", symbol);
+            return new WebhookResponse(false, "Orden rechazada por proximidad a noticia macro de alto impacto.");
+        }
+
+        // --- NUEVA VALIDACIÓN: Posición Abierta en Broker Real (Evitar desincronizaciones) ---
+        var positionsReq = new HttpRequestMessage(HttpMethod.Get, $"{_baseUrl}/positions");
+        positionsReq.Headers.Add("X-CAP-API-KEY", _apiKey);
+        positionsReq.Headers.Add("CST", cst);
+        positionsReq.Headers.Add("X-SECURITY-TOKEN", securityToken);
+
+        var positionsResp = await _httpClient.SendAsync(positionsReq);
+        if (!positionsResp.IsSuccessStatusCode)
+        {
+            throw new Exception($"Fallo al consultar posiciones abiertas en Capital.com. Status: {positionsResp.StatusCode}");
+        }
+
+        var posRawJson = await positionsResp.Content.ReadAsStringAsync();
+        var serializerOptions = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+        var activeCapitalPositions = System.Text.Json.JsonSerializer.Deserialize<CapitalPositionsResponse>(posRawJson, serializerOptions)?.Positions ?? new List<CapitalPositionItem>();
+
+        var epic = ResolveEpic(symbol);
+        var hasRealActivePosition = activeCapitalPositions.Any(p => 
+            p.Position != null && 
+            (string.Equals(p.Market?.Epic, epic, StringComparison.OrdinalIgnoreCase) || 
+             string.Equals(p.Market?.Symbol, symbol, StringComparison.OrdinalIgnoreCase)));
+
+        if (hasRealActivePosition)
+        {
+            _logger.LogWarning("Se recibió señal de APERTURA para {Symbol}, pero Capital.com ya tiene una posición abierta real en el broker.", symbol);
+            return new WebhookResponse(false, $"Orden ignorada. Ya existe una posición abierta en el broker real para {symbol}.");
+        }
+
+        // --- NUEVA VALIDACIÓN: Spread Dinámico en Tiempo Real ---
+        var (bid, ask, marketStatus) = await GetMarketPricesAsync(cst, securityToken, epic);
+        _logger.LogInformation("Consulta Precios en vivo para {Symbol}: Bid={Bid}, Ask={Ask}, Status={Status}", symbol, bid, ask, marketStatus);
+
+        if (!marketStatus.Equals("TRADEABLE", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogWarning("El mercado para {Symbol} no está operable en este momento: {Status}", symbol, marketStatus);
+            return new WebhookResponse(false, $"Mercado no operable ({marketStatus}).");
+        }
+
+        var isJpyPair = symbol.Contains("JPY", StringComparison.OrdinalIgnoreCase);
+        var pipSize = isJpyPair ? 0.01m : 0.0001m;
+        var realSpread = Math.Abs(ask - bid);
+        var realSpreadInPips = realSpread / pipSize;
+
+        _logger.LogInformation("Spread en tiempo real para {Symbol}: {Spread} pips (Ask - Bid = {Ask} - {Bid})", symbol, realSpreadInPips.ToString("F2"), ask, bid);
+
+        var maxAllowedSpread = 3.0m; // Límite de spread permitido (3 pips para Forex Majors)
+        if (realSpreadInPips > maxAllowedSpread)
+        {
+            _logger.LogWarning("Orden de APERTURA para {Symbol} rechazada debido a spread real ensanchado: {RealSpread} pips (Máximo permitido: {MaxSpread} pips)", 
+                symbol, realSpreadInPips.ToString("F2"), maxAllowedSpread);
+            return new WebhookResponse(false, $"Orden rechazada por spread real ensanchado ({realSpreadInPips:F1} pips).");
+        }
+
         // 2. Obtener Balance
         var balance = await GetAccountBalanceAsync(cst, securityToken);
 
@@ -265,8 +329,8 @@ public class CapitalComService
         }
 
         // Definir tamaño de pip según convención Forex (4 decimales para estándar, 2 para JPY)
-        var isJpyPair = symbol.Contains("JPY", StringComparison.OrdinalIgnoreCase);
-        var pipSize = isJpyPair ? 0.01m : 0.0001m;
+        isJpyPair = symbol.Contains("JPY", StringComparison.OrdinalIgnoreCase);
+        pipSize = isJpyPair ? 0.01m : 0.0001m;
         var slDistanceInPips = slDistance / pipSize;
 
         // Tamaño de posición (Size) = Riesgo Máximo / (Distancia SL en Pips * Pip Value por Unidad)
@@ -303,7 +367,7 @@ public class CapitalComService
             maxRisk.ToString("F2"), slDistanceInPips.ToString("F1"), calculatedSize);
 
         // 4. Enviar Orden Bracket OCO
-        var epic = ResolveEpic(symbol);
+        epic = ResolveEpic(symbol);
         var positionReq = new PositionRequest(
             Epic: epic,
             Direction: action.Equals("BUY", StringComparison.OrdinalIgnoreCase) ? "BUY" : "SELL",
@@ -509,6 +573,33 @@ public class CapitalComService
             await Task.Delay(200); // Esperar 200ms antes del próximo reintento
         }
         return null;
+    }
+
+    /// <summary>
+    /// Consulta Bid, Ask y estado del mercado en tiempo real de Capital.com
+    /// </summary>
+    private async Task<(decimal Bid, decimal Ask, string Status)> GetMarketPricesAsync(string cst, string securityToken, string epic)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, $"{_baseUrl}/markets/{epic}");
+        request.Headers.Add("X-CAP-API-KEY", _apiKey);
+        request.Headers.Add("CST", cst);
+        request.Headers.Add("X-SECURITY-TOKEN", securityToken);
+
+        var response = await _httpClient.SendAsync(request);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new Exception($"Fallo al consultar precios de mercado para {epic}. Status: {response.StatusCode}");
+        }
+
+        var rawJson = await response.Content.ReadAsStringAsync();
+        var options = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+        var marketData = System.Text.Json.JsonSerializer.Deserialize<CapitalMarketDetailsResponse>(rawJson, options);
+        if (marketData?.Snapshot == null)
+        {
+            throw new Exception($"No se obtuvo snapshot de mercado para {epic}");
+        }
+
+        return (marketData.Snapshot.Bid, marketData.Snapshot.Offer, marketData.Snapshot.MarketStatus);
     }
 
     /// <summary>

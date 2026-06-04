@@ -18,17 +18,6 @@ darvas_rrr    = input.float(2.0, "Ratio Riesgo/Beneficio Mínimo (1:X)", minval=
 // --- Filtros Operativos Estáticos ---
 ny_session    = input.session("0600-1200:23456", "Sesión de Alta Liquidez (Nueva York)", group="Filtros de Control")
 
-// --- Parámetros de Noticias (Visuales / Alertas - No bloqueantes para autonomía) ---
-enable_news_filter = input.bool(true, "Habilitar Filtro de Noticias Macro", group="Filtro de Noticias")
-news_daily_session = input.session("", "Horario Diario Bloqueo de Noticias", group="Filtro de Noticias")
-news1_start = input.time(timestamp("2026-06-05 08:30 -0400"), "Noticia 1: Inicio", group="Filtro de Noticias")
-news1_end   = input.time(timestamp("2026-06-05 09:00 -0400"), "Noticia 1: Fin", group="Filtro de Noticias")
-news2_start = input.time(timestamp("2026-06-10 14:00 -0400"), "Noticia 2: Inicio", group="Filtro de Noticias")
-news2_end   = input.time(timestamp("2026-06-10 14:30 -0400"), "Noticia 2: Fin", group="Filtro de Noticias")
-news3_start = input.time(timestamp("2026-06-18 14:00 -0400"), "Noticia 3: Inicio", group="Filtro de Noticias")
-news3_end   = input.time(timestamp("2026-06-18 14:30 -0400"), "Noticia 3: Fin", group="Filtro de Noticias")
-
-
 // ==========================================
 // PARÁMETROS HARDCODED (Quemados en el código para evitar Curve-Fitting)
 // ==========================================
@@ -38,7 +27,6 @@ sigma0_mult             = 0.5   // Multiplicador de volatilidad Estado 0
 mu1                     = 0.0   // Media esperada Estado 1 (Expansión)
 sigma1_mult             = 1.5   // Multiplicador de volatilidad Estado 1
 darvas_max_retest_bars  = 15    // Límite de velas para que el precio retestee la caja
-estimated_spread        = 1.5   // Spread base estimado (usado para calcular SL/TP teóricos)
 buffer_pips             = 2.0   // Buffer adicional para colocar el SL estructural
 min_sl_pips             = 5.0   // Stop Loss mínimo para evitar ruido y ejecuciones fantasma
 enable_trailing         = true  // Activar Trailing Stop ATR dinámico
@@ -93,7 +81,7 @@ f_build_json(action, ticker, lot, entry, sl, tp, strategy_name, magic, ts) =>
 f_calc_sl_tp(entry_price, sl_raw, is_long, rrr_val) =>
     sl_dist = is_long ? entry_price - sl_raw : sl_raw - entry_price
     sl_dist := math.max(sl_dist, 0.0)
-    sl_dist_pips = (sl_dist / pip_size) + estimated_spread
+    sl_dist_pips = sl_dist / pip_size
     final_sl_dist_pips = math.max(sl_dist_pips, min_sl_pips)
     
     final_sl = is_long ? entry_price - final_sl_dist_pips * pip_size : entry_price + final_sl_dist_pips * pip_size
@@ -170,16 +158,6 @@ hmm_expansion_active = (hmm_regime == 1)
 // ==========================================
 
 is_ny_session = not na(time(timeframe.period, ny_session))
-
-in_news_blackout = false
-if enable_news_filter
-    if news_daily_session != "" and not na(time(timeframe.period, news_daily_session))
-        in_news_blackout := true
-    if (time >= news1_start and time <= news1_end) or (time >= news2_start and time <= news2_end) or (time >= news3_start and time <= news3_end)
-        in_news_blackout := true
-
-news_expired = time > news3_end
-
 // Control de Drawdown Diario (Circuit Breaker)
 is_new_day = ta.change(time("D")) != 0
 var float daily_start_equity = na
@@ -210,8 +188,6 @@ else if daily_loss_limit_reached
     last_rejection_reason := "Drawdown: Límite Pérdidas Diario Alcanzado"
 else if daily_trades_limit_reached
     last_rejection_reason := "Trades: Límite Operaciones Diarias Alcanzado"
-else if in_news_blackout
-    last_rejection_reason := "Noticias: Bloqueo de Noticias Macro"
 
 
 // ==========================================
@@ -219,7 +195,7 @@ else if in_news_blackout
 // ==========================================
 
 // Matriz de señales permitidas
-allowed_to_enter = hmm_expansion_active and is_ny_session and not daily_loss_limit_reached and not daily_trades_limit_reached and not in_news_blackout and (strategy.opentrades == 0)
+allowed_to_enter = hmm_expansion_active and is_ny_session and not daily_loss_limit_reached and not daily_trades_limit_reached
 
 var bool waiting_retest_long = false
 var bool waiting_retest_short = false
@@ -231,13 +207,13 @@ darvas_crossover = ta.crossover(close, darvas_top)
 darvas_crossunder = ta.crossunder(close, darvas_bottom)
 
 // Al ocurrir una ruptura, se cancelan límites anteriores y se configuran los nuevos niveles de retest
-if darvas_crossover and (strategy.opentrades == 0)
+if darvas_crossover
     waiting_retest_long := true
     waiting_retest_short := false
     retest_level := darvas_top
     retest_bars_counter := 0
 
-if darvas_crossunder and (strategy.opentrades == 0)
+if darvas_crossunder
     waiting_retest_long := false
     waiting_retest_short := true
     retest_level := darvas_bottom
@@ -352,7 +328,7 @@ if strategy.position_size != 0
         
     float base_sl_level = active_calculated_sl
     if break_even_active
-        be_sl_price = entry_price_val + (is_long_trade ? 1 : -1) * estimated_spread * pip_size
+        be_sl_price = entry_price_val + (is_long_trade ? 1 : -1) * 1.5 * pip_size
         base_sl_level := is_long_trade ? math.max(active_calculated_sl, be_sl_price) : math.min(active_calculated_sl, be_sl_price)
         
     // Hito de Activación Trailing Stop
@@ -418,7 +394,7 @@ bgcolor(hmm_expansion_active ? color.new(color.green, 97) : color.new(color.red,
 plot(strategy.position_size != 0 ? active_calculated_sl : na, color=color.red, style=plot.style_linebr, linewidth=2, title="Stop Loss Activo")
 plot(strategy.position_size != 0 and not na(active_calculated_tp) ? active_calculated_tp : na, color=color.green, style=plot.style_linebr, linewidth=2, title="Take Profit Activo")
 
-var table audit_table = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 20), border_color=color.black, border_width=1)
+var table audit_table = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 20), border_color=color.black, border_width=1)
 if barstate.islast
     table.cell(audit_table, 0, 0, "Métrica", text_color=color.yellow, text_size=size.small, bgcolor=color.black)
     table.cell(audit_table, 1, 0, "Valor", text_color=color.yellow, text_size=size.small, bgcolor=color.black)
@@ -435,11 +411,8 @@ if barstate.islast
     table.cell(audit_table, 0, 4, "PnL Diario", text_color=color.white, text_size=size.small)
     table.cell(audit_table, 1, 4, str.tostring(daily_pnl, "#.##") + " USD", text_color=daily_pnl >= 0 ? color.green : color.red, text_size=size.small)
     
-    table.cell(audit_table, 0, 5, "Filtro Noticias", text_color=color.white, text_size=size.small)
-    table.cell(audit_table, 1, 5, news_expired and enable_news_filter ? "VENCIDO" : in_news_blackout ? "BLOQUEADO" : "OK", text_color=in_news_blackout or (news_expired and enable_news_filter) ? color.red : color.green, text_size=size.small)
+    table.cell(audit_table, 0, 5, "Estado del Bot", text_color=color.white, text_size=size.small)
+    table.cell(audit_table, 1, 5, strategy.position_size != 0 ? "EN TRADE" : "BÚSQUEDA", text_color=strategy.position_size != 0 ? color.orange : color.green, text_size=size.small)
     
-    table.cell(audit_table, 0, 6, "Estado del Bot", text_color=color.white, text_size=size.small)
-    table.cell(audit_table, 1, 6, strategy.position_size != 0 ? "EN TRADE" : "BÚSQUEDA", text_color=strategy.position_size != 0 ? color.orange : color.green, text_size=size.small)
-    
-    table.cell(audit_table, 0, 7, "Último Rechazo", text_color=color.white, text_size=size.small)
-    table.cell(audit_table, 1, 7, last_rejection_reason, text_color=color.yellow, text_size=size.small)
+    table.cell(audit_table, 0, 6, "Último Rechazo", text_color=color.white, text_size=size.small)
+    table.cell(audit_table, 1, 6, last_rejection_reason, text_color=color.yellow, text_size=size.small)

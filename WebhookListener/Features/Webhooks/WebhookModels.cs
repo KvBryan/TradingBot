@@ -101,3 +101,14 @@ public record CapitalAffectedDeal(
     [property: JsonPropertyName("dealId")] string DealId,
     [property: JsonPropertyName("status")] string Status
 );
+
+// --- DTOs para Precios de Mercado y Spread de Capital.com ---
+public record CapitalMarketDetailsResponse(
+    [property: JsonPropertyName("snapshot")] CapitalMarketSnapshot Snapshot
+);
+
+public record CapitalMarketSnapshot(
+    [property: JsonPropertyName("bid")] decimal Bid,
+    [property: JsonPropertyName("offer")] decimal Offer,
+    [property: JsonPropertyName("marketStatus")] string MarketStatus
+);
