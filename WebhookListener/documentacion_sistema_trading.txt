@@ -40,7 +40,7 @@ A. ESTRATEGIA Y GENERACIÓN DE SEÑALES (FRONT-END TRADINGVIEW)
    - Parámetro de Regla de Cierre: `close_entries_rule = "ANY"` inyectado para asegurar la compatibilidad con el motor v6 y evitar la desincronización FIFO de posiciones acumuladas.
    - Motor Matemático: Hidden Markov Model (HMM) autocalibrable de 2 estados.
    - Lógica de Entrada: Canal Darvas Box adaptado sin retraso de pivote y ejecución por **Órdenes Límite** (Buy Limit / Sell Limit).
-   - Lógica de Riesgo: Lotaje dinámico por volatilidad ATR y especificaciones del contrato (`syminfo.contractsize`, `syminfo.pipvalue`).
+   - Lógica de Riesgo: Lotaje dinámico basado en la distancia al Stop Loss estructural (en pips), el capital arriesgado del 1% y las especificaciones del contrato (`syminfo.contractsize`, `syminfo.pipvalue`); el ATR se utiliza exclusivamente para el cálculo del stop dinámico de arrastre (Trailing Stop).
 
 B. PROCESAMIENTO Y EJECUCIÓN (BACKEND - MICROSERVICIO C#)
    - Framework: .NET 8/9 (ASP.NET Core Minimal APIs).
@@ -218,10 +218,10 @@ FASE 3: CREACIÓN DE ALERTAS EN TRADINGVIEW
 2. En tu gráfico de TradingView, presiona `Alt + A` para crear una nueva alerta.
 3. Elige como condición la estrategia: **Estrategia Cuantitativa Avanzada HMM v6**.
 4. En **URL del Webhook**, marca la casilla y escribe tu endpoint TLS seguro:
-   `https://bot.kvstudio.me/api/v1/webhook`
+    `https://bot.kvstudio.me/api/v1/webhook`
 5. En la caja de **Mensaje**, borra todo y pega **exclusivamente**:
-   `{{strategy.order.alert_message}}`
-6. Guarda la alerta. A partir de este momento, cada vez que TradingView ejecute una orden límite o la cierre, enviará el JSON firmado hacia tu VPS, el cual registrará la operación en PostgreSQL, actualizará tu Dashboard React en tiempo real y ruteará la orden a Capital.com.
+    `{{strategy.order.alert_message}}`
+6. Guarda la alerta. A partir de este momento, cada vez que TradingView ejecute una orden límite o la cierre, enviará el payload JSON hacia tu VPS, el cual registrará la operación en PostgreSQL, actualizará tu Dashboard React en tiempo real y ruteará la orden a Capital.com (Ver la Sección 9.E para detalles sobre la seguridad perimetral del webhook).
 
 FASE 4: MIGRACIÓN DE CUENTA DEMO A CUENTA REAL
 Para pasar el sistema de operaciones simuladas (Demo) a operaciones con capital real en el broker Capital.com, **no necesitas cambiar tu código de Pine Script ni reescribir tu aplicación C#**. Los pasos son los siguientes:
@@ -280,11 +280,11 @@ C. Ejemplo de Payload JSON (Cierre):
    ```
 
 D. Campos Obligatorios y Validaciones:
-   - "action" (string): Obligatorio. Valores admitidos: "BUY", "SELL", "CLOSE", "CANCEL".
+   - "action" (string): Obligatorio. Valores admitidos en el script: "BUY", "SELL", "CLOSE". (Nota: El script cancela órdenes internamente en TradingView usando `strategy.cancel` pero estas acciones no disparan alertas webhook CANCEL hacia el backend).
    - "symbol" (string): Obligatorio. Identifica el instrumento (ej. "EURUSD", "GBPUSD", "USDJPY").
    - "entry_price", "stop_loss", "take_profit" (decimal/null):
      - Para aperturas (BUY / SELL): Son estrictamente obligatorios y deben ser mayores a cero.
-     - Para cierres (CLOSE / CANCEL): Se pueden omitir o enviar como null.
+     - Para cierres (CLOSE): Se pueden omitir o enviar como null.
    - "strategy" (string): Obligatorio. Identifica la estrategia de procedencia (ej. "Darvas Box").
    - "trade_id" (string): Obligatorio. Hash único en formato: `Ticker_MagicNumber_TimestampUnix`.
 
@@ -323,10 +323,10 @@ stateDiagram-v2
     
     Limit_Order_Placed --> Idle : Cancelación de orden (retest_bars_counter > 15 velas)
     
-    Limit_Order_Placed --> Position_Entered : Precio retestea y toca el nivel
+    Limit_Order_Placed --> Position_Entered : El precio retestea y toca el nivel de retest
     note right of Position_Entered
-        Se ejecuta orden límite en TradingView.
-        Se envía Webhook POST al backend.
+        Se llena la orden límite virtual en TradingView.
+        TradingView envía el Webhook POST (BUY/SELL) al backend.
         Backend abre orden real a mercado en Capital.com.
         Estado del trade en PostgreSQL pasa a "OPEN".
     end note
@@ -355,9 +355,9 @@ stateDiagram-v2
 --------------------------------------------------------------------------------
 Para garantizar la consistencia en el cálculo de drawdown diario, el control horario y las marcas de tiempo entre el gráfico de TradingView, el microservicio y el broker, se establecen las siguientes reglas:
 
-- **Reset del Drawdown Diario**: Se ejecuta mediante `ta.change(time("D")) != 0` utilizando la zona horaria del instrumento (Forex operando 24 horas usa UTC). El drawdown diario y el contador de trades se reinician a cero a las 00:00 UTC.
-- **Sesión Operativa Nueva York (NY)**: La ventana operativa segura de volatilidad se define mediante el parámetro `ny_session = "0600-1200:23456"`, evaluado en base al huso horario de Nueva York (EST/EDT) para concentrar las entradas en las horas de mayor liquidez.
-- **Filtro de Noticias Macro**: Los límites de bloqueo de noticias (`news1_start`, etc.) se declaran utilizando el timezone local de New York especificando el desfase GMT en Pine Script (ej. `-0400` para horario de verano de Nueva York - EDT).
+- **Reset del Drawdown Diario**: Se ejecuta mediante `ta.change(time("D")) != 0`. Dado que Pine Script evalúa `time("D")` en la zona horaria del gráfico activa, es indispensable configurar el gráfico de TradingView en la zona horaria del exchange (UTC para Forex) para que el reinicio de drawdown diario y contador de operaciones ocurra puntualmente a las 00:00 UTC de forma consistente.
+- **Sesión Operativa Nueva York (NY)**: La ventana operativa se define por `ny_session = "0600-1200:23456"`. Al no incluir sufijo de timezone en el parámetro, se evalúa en el huso del gráfico (NY exchange). Por lo tanto, el gráfico debe coincidir para sincronizarse con la mañana de Nueva York (EST/EDT).
+- **Filtro de Noticias Macro**: Los límites de bloqueo de noticias (`news1_start`, etc.) declaran explícitamente su zona horaria dentro de la función de Pine Script mediante desfases (ej. `timestamp("2026-06-05 08:30 -0400")` para EDT), garantizando total independencia del huso horario del gráfico para esta sección.
 - **Marcas de Tiempo (Timestamps)**: El webhook envía la variable nativa `time` de Pine (milisegundos Unix en formato UTC). El backend almacena todas las marcas de tiempo de creación e histórico en PostgreSQL utilizando UTC (`DateTime.UtcNow`).
 
 --------------------------------------------------------------------------------
@@ -398,7 +398,7 @@ Donde:
 2. **Filtro de Noticias Macro**:
    - *Aclaración*: El filtro es semi-manual. Depende de las variables `newsX_start` y `newsX_end` configuradas en Pine Script. Si no se actualizan las fechas para eventos futuros o si `news_expired` marca `true` (al pasar `news3_end`), el filtro debe desactivarse manualmente o actualizarse en TradingView para evitar el bloqueo preventivo indefinido.
 3. **Interacción entre Filtros y Retest**:
-   - *Aclaración*: El bot detecta las rupturas Darvas y activa el estado de retest en Pine Script *antes* de comprobar los filtros de entrada (`allowed_to_enter`). Si el precio retestea el nivel de retest en un momento en que los filtros temporales (ej: noticias o fuera de hora) ya no bloquean la entrada, el bot colocará la orden. Si los filtros siguen activos al retestear, la señal expira silenciosamente sin colocar orden límite virtual.
+   - *Aclaración*: El bot detecta las rupturas Darvas y activa el estado de espera de retest (`waiting_retest_long` / `waiting_retest_short = true`) antes de evaluar los filtros operativos de entrada. Si `allowed_to_enter` se vuelve verdadero (por ejemplo, al salir del horario de bloqueo por noticias) mientras el estado de espera sigue activo (dentro del límite máximo de 15 velas), el script coloca la orden límite virtual en el nivel de retest. Dicha orden queda activa en el mercado esperando a ser ejecutada si el precio regresa a tocar ese nivel. Si el bloqueo operativo dura más de 15 velas, el estado de retest expira y la orden virtual no llega a colocarse.
 
 ================================================================================
 FIN DEL DOCUMENTO
