@@ -110,7 +110,7 @@ export const LoginView: React.FC = () => {
             <img
               alt="Kronos Quant Logo"
               className="h-10 w-10 object-contain"
-              src="https://lh3.googleusercontent.com/aida/AP1WRLuTaEtxK_voxZIIrQgl9KzwyJQOnjT0GGGIJoEEVa9AjIDuhZ6WQdoZDyL8DltFTo3t37Ytuor3LDj3rxUcBLKSOoKOtO94mkG2dRx50sZmSILggN4ZFC7QtFMJGpUkgBtYRUghygrjzp0Guogx2TLGa-TvYYe_2Zf22ESmV2z6Wp7dtnVyKcnzBv0jak6-uNoC97_RPAOPFWqOJX20EIpZiiGhQyl-c946xjb2un5XNr-00OR5JpEgpyU"
+              src="/kronos_quant_logo.png"
             />
             <h1 className="font-headline-lg text-headline-lg text-primary tracking-tighter uppercase font-sora">
               Kronos Quant
